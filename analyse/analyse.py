@@ -1,8 +1,12 @@
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
+from matplotlib.patches import Patch
+
 df_passage = pd.read_csv('passages_global.csv')
 
+# Convertir date_course en vrai datetime (date uniquement)
+df_passage['date_course'] = pd.to_datetime(df_passage['date_course'], errors='coerce').dt.date
 # ── 1. Nettoyage ──────────────────────────────────────────────────────────────
 
 df_passage['retard_depart_sec'] = pd.to_numeric(
@@ -91,7 +95,6 @@ ax.axhline(0, color='black', linewidth=0.8, linestyle='--')
 etiqueter_barres(ax, barres, toutes['retard_moyen'].values)
 
 # Légende manuelle
-from matplotlib.patches import Patch
 legende = [
     Patch(facecolor='#e74c3c', label='En retard'),
     Patch(facecolor='#2ecc71', label='En avance'),
@@ -107,3 +110,41 @@ plt.tight_layout()
 plt.savefig("retard_toutes_lignes.png", dpi=150)
 plt.show()
 print("Graphique sauvegardé : retard_toutes_lignes.png")
+
+# ── 5. Graphique 3 : évolution du retard par date réelle ─────────────────────
+
+stats_date = (
+    df_passage
+    .groupby(['date_course', 'nom_ligne'])['retard_depart_sec']
+    .mean()
+    .reset_index()
+    .rename(columns={'retard_depart_sec': 'retard_moyen'})
+)
+
+lignes_disponibles = stats_date['nom_ligne'].unique()
+palette = ['#1f77b4','#ff7f0e','#2ca02c','#d62728','#9467bd',
+           '#8c564b','#e377c2','#7f7f7f','#bcbd22','#17becf']
+couleur_map = {l: palette[i % len(palette)] for i, l in enumerate(sorted(lignes_disponibles))}
+
+fig, ax = plt.subplots(figsize=(14, 6))
+
+for ligne in sorted(lignes_disponibles):
+    data = stats_date[stats_date['nom_ligne'] == ligne].sort_values('date_course')
+    ax.plot(
+        data['date_course'].astype(str),
+        data['retard_moyen'],
+        marker='o', markersize=4,
+        label=ligne,
+        color=couleur_map[ligne]
+    )
+
+ax.axhline(0, color='black', linewidth=0.8, linestyle='--')
+ax.set_title("Évolution du retard moyen par date réelle et par ligne")
+ax.set_xlabel("Date (issue de date_course)")
+ax.set_ylabel("Retard moyen (secondes)")
+plt.xticks(rotation=45, ha='right')
+ax.legend(loc='upper left', fontsize=7, ncol=3)
+plt.tight_layout()
+plt.savefig("retard_par_date.png", dpi=150)
+plt.show()
+print("Graphique sauvegardé : retard_par_date.png")
