@@ -31,7 +31,7 @@ from datetime import datetime, timezone
 API_KEYS        = ["bh8enPs1rJpVrXrpxUrXGAWq3f3BbCLu","UxZ2oEXNyvd3ym0zbx2AGgW0w8AYgHSj"]
 _current_key_idx = 0   # index de la clé active
 BASE_URL  = "https://prim.iledefrance-mobilites.fr/marketplace"
-CSV_FILE  = "passages_global.csv"
+CSV_FILE  = "dataset_predictions/passages_global.csv"
 
 # Pause entre chaque requête ligne (secondes) — évite le rate-limiting
 PAUSE_ENTRE_LIGNES = 1.0
@@ -53,6 +53,9 @@ log = logging.getLogger(__name__)
 #   curl 'https://prim.iledefrance-mobilites.fr/marketplace/estimated-timetable
 #         ?LineRef=STIF%3ALine%3A%3AC01742%3A'
 # ─────────────────────────────────────────────
+
+# Dictionnaire inversé : line_ref → nom lisible (pour remplir nom_ligne depuis la réponse ALL)
+LIGNES_PAR_REF: dict[str, str] = {}  # rempli après LIGNES
 
 LIGNES = {
     # ── Métro ──────────────────────────────
@@ -102,6 +105,9 @@ LIGNES = {
     "Tram T11":  "STIF:Line::C02024:",
     "Tram T13":  "STIF:Line::C02048:",
 }
+
+# Remplissage du dict inversé
+LIGNES_PAR_REF = {ref: nom for nom, ref in LIGNES.items()}
 
 # ─────────────────────────────────────────────
 # COLONNES CSV
@@ -226,19 +232,14 @@ def _iso(field) -> str:
 # APPEL API — /estimated-timetable
 # ─────────────────────────────────────────────
 
-def get_estimated_timetable(line_ref: str) -> list[dict]:
+def get_estimated_timetable() -> list[dict]:
     """
-    Appelle GET /estimated-timetable pour une ligne.
-    Gère les deux formats SIRI retournés par PRIM :
-      - Format SNCF/Tram : AimedDepartureTime + ExpectedDepartureTime
-        → retard calculable directement
-      - Format RATP Métro : uniquement ExpectedDepartureTime (pas d'Aimed)
-        → retard marqué "Non disponible (RATP)"
-        → heure_tranche calculée depuis l'Expected
+    Appelle GET /estimated-timetable avec LineRef=ALL (toutes les lignes en une requête).
+    Extrait line_ref depuis chaque course SIRI et déduit nom_ligne via LIGNES_PAR_REF.
     """
     global _current_key_idx
     url    = f"{BASE_URL}/estimated-timetable"
-    params = {"LineRef": line_ref}
+    params = {"LineRef": "ALL"}
 
     # Rotation de clé en cas de 429 — essaie chaque clé une fois
     for _ in range(len(API_KEYS)):
@@ -282,6 +283,8 @@ def get_estimated_timetable(line_ref: str) -> list[dict]:
 
                 for journey in journeys:
                     # — Métadonnées de la course — dépaquetage systématique
+                    line_ref  = _val(journey.get("LineRef"))
+                    nom_ligne = LIGNES_PAR_REF.get(line_ref, line_ref)
                     vj_ref = _val(
                         journey.get("FramedVehicleJourneyRef", {})
                                .get("DatedVehicleJourneyRef")
@@ -352,7 +355,7 @@ def get_estimated_timetable(line_ref: str) -> list[dict]:
                         rows.append({
                             "timestamp_collecte":     now_local.isoformat(timespec="seconds"),
                             "timestamp_utc":          now_utc.isoformat(timespec="seconds"),
-                            "nom_ligne":              "",   # rempli par l'appelant
+                            "nom_ligne":              nom_ligne,
                             "line_ref":               line_ref,
                             "operateur":              operateur,
                             "direction_ref":          direction,
@@ -381,7 +384,7 @@ def get_estimated_timetable(line_ref: str) -> list[dict]:
                         })
 
     except (KeyError, TypeError) as e:
-        log.warning(f"Parsing échoué pour {line_ref} : {e}")
+        log.warning(f"Parsing échoué : {e}")
 
     return rows
 
@@ -404,20 +407,29 @@ def ecrire_csv(rows: list[dict]):
 def collecter_toutes_les_lignes() -> int:
     """Un cycle : interroge toutes les lignes, retourne le nombre de lignes écrites."""
     total = 0
-    for nom, ref in LIGNES.items():
-        log.info(f"  → {nom} ({ref})")
-        try:
-            rows = get_estimated_timetable(ref)
-            for r in rows:
-                r["nom_ligne"] = nom
-            ecrire_csv(rows)
-            total += len(rows)
-            log.info(f"     {len(rows)} arrêts écrits")
-        except requests.HTTPError as e:
-            log.error(f"     HTTP {e.response.status_code} — {e.response.text[:120]}")
-        except Exception as e:
-            log.error(f"     Erreur : {e}")
-        time.sleep(PAUSE_ENTRE_LIGNES)
+    #for nom, ref in LIGNES.items():
+    #    log.info(f"  → {nom} ({ref})")
+    #    try:
+    #        rows = get_estimated_timetable(ref)
+    #        for r in rows:
+    #            r["nom_ligne"] = nom
+    #        ecrire_csv(rows)
+    #        total += len(rows)
+    #        log.info(f"     {len(rows)} arrêts écrits")
+    #    except requests.HTTPError as e:
+    #        log.error(f"     HTTP {e.response.status_code} — {e.response.text[:120]}")
+    #    except Exception as e:
+    #        log.error(f"     Erreur : {e}")
+    #    time.sleep(PAUSE_ENTRE_LIGNES)
+    try:
+        rows = get_estimated_timetable()
+        ecrire_csv(rows)
+        total = len(rows)
+        log.info(f"  {total} arrêts écrits (requête ALL)")
+    except requests.HTTPError as e:
+        log.error(f"  HTTP {e.response.status_code} — {e.response.text[:120]}")
+    except Exception as e:
+        log.error(f"  Erreur : {e}")
     return total
 
 

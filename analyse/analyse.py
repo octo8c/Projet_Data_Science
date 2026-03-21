@@ -1,20 +1,14 @@
+import matplotlib
+matplotlib.use('TkAgg')  # Backend interactif sans Qt/Wayland
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
-from matplotlib.patches import Patch
 
-df_passage = pd.read_csv('passages_global.csv')
-
-# Convertir date_course en vrai datetime (date uniquement)
+df_passage = pd.read_csv('dataset_predictions/passages_global.csv')
 df_passage['date_course'] = pd.to_datetime(df_passage['date_course'], errors='coerce').dt.date
-# ── 1. Nettoyage ──────────────────────────────────────────────────────────────
+df_passage['retard_depart_sec'] = pd.to_numeric(df_passage['retard_depart_sec'], errors='coerce')
 
-df_passage['retard_depart_sec'] = pd.to_numeric(
-    df_passage['retard_depart_sec'], errors='coerce'
-)
-# Les valeurs négatives sont conservées (train en avance = valeur réelle)
-
-# ── 2. Agrégation par ligne ───────────────────────────────────────────────────
+# ── Agrégation par ligne ──────────────────────────────────────────────────────
 
 stats_ligne = (
     df_passage
@@ -25,126 +19,176 @@ stats_ligne = (
     .sort_values('retard_moyen', ascending=False)
 )
 
-print("\nRetard moyen par ligne (secondes) :")
-print(stats_ligne.to_string(index=False))
+# Lignes avec un nom lisible (exclure codes STIF bruts)
+stats_lisibles = stats_ligne[~stats_ligne['nom_ligne'].str.startswith('STIF')]
 
-# ── Helper : étiquette + position de texte ────────────────────────────────────
+print("\nRetard moyen par ligne nommée (secondes) :")
+print(stats_lisibles.to_string(index=False))
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+PALETTE = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd',
+           '#8c564b', '#e377c2', '#7f7f7f', '#bcbd22', '#17becf']
+
 
 def etiqueter_barres(ax, barres, valeurs):
     for bar, val in zip(barres, valeurs):
-        if pd.isna(val):
-            label = "N/A"
-        else:
-            label = f"{val:+.1f}s"          # + devant les positifs, - devant les négatifs
+        h = bar.get_height()
+        if pd.isna(val) or not np.isfinite(h):
+            continue
         offset = 1 if val >= 0 else -3
-        va     = 'bottom' if val >= 0 else 'top'
-        ax.text(
-            bar.get_x() + bar.get_width() / 2,
-            bar.get_height() + offset,
-            label,
-            ha='center', va=va, fontsize=8, fontweight='bold'
-        )
+        va = 'bottom' if val >= 0 else 'top'
+        ax.text(bar.get_x() + bar.get_width() / 2, h + offset,
+                f"{val:+.1f}s", ha='center', va=va, fontsize=8, fontweight='bold')
 
-def couleur_barre(val):
-    """Vert si en avance, rouge si en retard, gris si NaN."""
-    if pd.isna(val):
-        return '#aaaaaa'
-    return '#e74c3c' if val > 0 else '#2ecc71'
 
-# ── 3. Graphique 1 : lignes RER uniquement (1 couleur par ligne) ──────────────
-
-rer = stats_ligne[stats_ligne['nom_ligne'].str.startswith('RER')].copy()
-
-if rer.empty:
-    print("\nAucune ligne RER trouvée.")
-else:
-    # Palette distincte : 1 couleur par ligne RER
-    palette = ['#1f77b4','#ff7f0e','#2ca02c','#d62728','#9467bd',
-               '#8c564b','#e377c2','#7f7f7f','#bcbd22','#17becf']
-    couleurs_rer = [palette[i % len(palette)] for i in range(len(rer))]
-
-    fig, ax = plt.subplots(figsize=(10, 6))
-    barres = ax.bar(rer['nom_ligne'], rer['retard_moyen'],
-                    color=couleurs_rer, edgecolor='white', width=0.6)
-
-    # Ligne de référence à 0
+def graphique_lignes(df_stats, prefixe, titre, fichier):
+    """Graphique barres pour toutes les lignes commençant par `prefixe`."""
+    sous = df_stats[df_stats['nom_ligne'].str.startswith(prefixe)].copy()
+    if sous.empty:
+        print(f"\nAucune ligne '{prefixe}' trouvée.")
+        return
+    couleurs = [PALETTE[i % len(PALETTE)] for i in range(len(sous))]
+    fig, ax = plt.subplots(figsize=(max(8, len(sous) * 1.4), 6))
+    barres = ax.bar(sous['nom_ligne'], sous['retard_moyen'],
+                    color=couleurs, edgecolor='white', width=0.6)
     ax.axhline(0, color='black', linewidth=0.8, linestyle='--')
-
-    etiqueter_barres(ax, barres, rer['retard_moyen'].values)
-
-    ax.set_title("Retard moyen au départ — Lignes RER\n(négatif = en avance sur l'horaire)")
+    etiqueter_barres(ax, barres, sous['retard_moyen'].values)
+    ax.set_title(titre)
     ax.set_xlabel("Ligne")
     ax.set_ylabel("Retard moyen (secondes)")
     plt.xticks(rotation=30, ha='right')
     plt.tight_layout()
-    plt.savefig("retard_rer.png", dpi=150)
+    plt.savefig(fichier, dpi=150)
+    print(f"Graphique sauvegardé : {fichier}")
     plt.show()
-    print("Graphique sauvegardé : retard_rer.png")
 
-# ── 4. Graphique 2 : toutes les lignes du dataset ────────────────────────────
 
-toutes = stats_ligne.copy()
-couleurs_toutes = [couleur_barre(v) for v in toutes['retard_moyen']]
+# ── Graphique 1 : Lignes RER ──────────────────────────────────────────────────
 
-fig, ax = plt.subplots(figsize=(max(14, len(toutes) * 0.6), 7))
-barres = ax.bar(toutes['nom_ligne'], toutes['retard_moyen'],
-                color=couleurs_toutes, edgecolor='white', width=0.7)
+graphique_lignes(stats_ligne, 'RER',
+                 "Retard moyen au départ — Lignes RER\n(négatif = en avance sur l'horaire)",
+                 "retard_rer.png")
 
+# ── Graphique 2 : Lignes Tram ─────────────────────────────────────────────────
+
+graphique_lignes(stats_ligne, 'Tram',
+                 "Retard moyen au départ — Lignes Tram\n(négatif = en avance sur l'horaire)",
+                 "retard_tram.png")
+
+# ── Graphique 3 : Top 20 stations générant le plus de retard ──────────────────
+
+TOP_N = 20
+stats_arret = (
+    df_passage[df_passage['retard_depart_sec'] > 0]
+    .groupby('nom_arret')['retard_depart_sec']
+    .mean()
+    .reset_index()
+    .rename(columns={'retard_depart_sec': 'retard_moyen'})
+    .sort_values('retard_moyen', ascending=False)
+    .head(TOP_N)
+)
+print(f"\nTop {TOP_N} stations par retard moyen :")
+print(stats_arret.to_string(index=False))
+
+fig, ax = plt.subplots(figsize=(14, 7))
+barres = ax.bar(stats_arret['nom_arret'], stats_arret['retard_moyen'],
+                color='#e74c3c', edgecolor='white', width=0.7)
+etiqueter_barres(ax, barres, stats_arret['retard_moyen'].values)
 ax.axhline(0, color='black', linewidth=0.8, linestyle='--')
-
-etiqueter_barres(ax, barres, toutes['retard_moyen'].values)
-
-# Légende manuelle
-legende = [
-    Patch(facecolor='#e74c3c', label='En retard'),
-    Patch(facecolor='#2ecc71', label='En avance'),
-    Patch(facecolor='#aaaaaa', label='Données manquantes'),
-]
-ax.legend(handles=legende, loc='upper right')
-
-ax.set_title("Retard moyen au départ — Toutes les lignes\n(négatif = en avance, ex: RER A ≈ −7s)")
-ax.set_xlabel("Ligne")
+ax.set_title(f"Top {TOP_N} stations générant le plus de retard moyen au départ")
+ax.set_xlabel("Station")
 ax.set_ylabel("Retard moyen (secondes)")
 plt.xticks(rotation=45, ha='right')
 plt.tight_layout()
-plt.savefig("retard_toutes_lignes.png", dpi=150)
+plt.savefig("retard_top_stations.png", dpi=150)
+print("Graphique sauvegardé : retard_top_stations.png")
 plt.show()
-print("Graphique sauvegardé : retard_toutes_lignes.png")
 
-# ── 5. Graphique 3 : évolution du retard par date réelle ─────────────────────
+# ── Graphique 4 : Top 5 stations par ligne (subplots) ────────────────────────
+
+TOP_LIGNES = 6
+TOP_ARRETS = 5
+
+top_lignes_names = (
+    stats_lisibles[stats_lisibles['retard_moyen'] > 0]
+    .head(TOP_LIGNES)['nom_ligne']
+    .tolist()
+)
+
+rows = []
+for ligne in top_lignes_names:
+    sub = (
+        df_passage[
+            (df_passage['nom_ligne'] == ligne) &
+            (df_passage['retard_depart_sec'] > 0)
+        ]
+        .groupby('nom_arret')['retard_depart_sec']
+        .mean()
+        .nlargest(TOP_ARRETS)
+        .reset_index()
+        .rename(columns={'retard_depart_sec': 'retard_moyen', 'nom_arret': 'station'})
+    )
+    sub['ligne'] = ligne
+    rows.append(sub)
+
+if rows:
+    df_top = pd.concat(rows, ignore_index=True)
+    n = len(top_lignes_names)
+    fig, axes = plt.subplots(1, n, figsize=(3.8 * n, 6), sharey=False)
+    if n == 1:
+        axes = [axes]
+    for ax, ligne in zip(axes, top_lignes_names):
+        data = df_top[df_top['ligne'] == ligne].sort_values('retard_moyen')
+        ax.barh(data['station'], data['retard_moyen'], color='#e74c3c', edgecolor='white')
+        xmax = data['retard_moyen'].max()
+        for i, (_, row) in enumerate(data.iterrows()):
+            ax.text(row['retard_moyen'] + xmax * 0.02, i,
+                    f"{row['retard_moyen']:.0f}s", va='center', fontsize=8)
+        ax.set_title(ligne, fontsize=10, fontweight='bold')
+        ax.set_xlabel("Retard moyen (s)")
+        ax.tick_params(axis='y', labelsize=8)
+    fig.suptitle(f"Top {TOP_ARRETS} stations par retard — {TOP_LIGNES} lignes les plus en retard",
+                 fontsize=12)
+    plt.tight_layout()
+    plt.savefig("retard_stations_par_ligne.png", dpi=150, bbox_inches='tight')
+    print("Graphique sauvegardé : retard_stations_par_ligne.png")
+    plt.show()
+
+# ── Graphique 5 : Évolution du retard par date ───────────────────────────────
+
+TOP_LIGNES_DATE = 5
+top_lignes_date = (
+    stats_lisibles[stats_lisibles['retard_moyen'] > 0]
+    .head(TOP_LIGNES_DATE)['nom_ligne']
+    .tolist()
+)
 
 stats_date = (
-    df_passage
+    df_passage[df_passage['nom_ligne'].isin(top_lignes_date)]
     .groupby(['date_course', 'nom_ligne'])['retard_depart_sec']
     .mean()
     .reset_index()
     .rename(columns={'retard_depart_sec': 'retard_moyen'})
 )
 
-lignes_disponibles = stats_date['nom_ligne'].unique()
-palette = ['#1f77b4','#ff7f0e','#2ca02c','#d62728','#9467bd',
-           '#8c564b','#e377c2','#7f7f7f','#bcbd22','#17becf']
-couleur_map = {l: palette[i % len(palette)] for i, l in enumerate(sorted(lignes_disponibles))}
+couleur_map = {l: PALETTE[i % len(PALETTE)] for i, l in enumerate(sorted(top_lignes_date))}
 
 fig, ax = plt.subplots(figsize=(14, 6))
-
-for ligne in sorted(lignes_disponibles):
+for ligne in sorted(top_lignes_date):
     data = stats_date[stats_date['nom_ligne'] == ligne].sort_values('date_course')
-    ax.plot(
-        data['date_course'].astype(str),
-        data['retard_moyen'],
-        marker='o', markersize=4,
-        label=ligne,
-        color=couleur_map[ligne]
-    )
+    if data.empty:
+        continue
+    ax.plot(data['date_course'].astype(str), data['retard_moyen'],
+            marker='o', markersize=4, label=ligne, color=couleur_map[ligne])
 
 ax.axhline(0, color='black', linewidth=0.8, linestyle='--')
-ax.set_title("Évolution du retard moyen par date réelle et par ligne")
-ax.set_xlabel("Date (issue de date_course)")
+ax.set_title(f"Évolution du retard moyen par date — Top {TOP_LIGNES_DATE} lignes les plus en retard")
+ax.set_xlabel("Date")
 ax.set_ylabel("Retard moyen (secondes)")
 plt.xticks(rotation=45, ha='right')
-ax.legend(loc='upper left', fontsize=7, ncol=3)
+ax.legend(loc='upper left', fontsize=9)
 plt.tight_layout()
 plt.savefig("retard_par_date.png", dpi=150)
-plt.show()
 print("Graphique sauvegardé : retard_par_date.png")
+plt.show()
