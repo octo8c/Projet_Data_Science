@@ -12,8 +12,11 @@ Usage :
 """
 
 import argparse
+import asyncio
+import json
 import warnings
 import os
+from concurrent.futures import ProcessPoolExecutor
 
 import numpy as np
 import pandas as pd
@@ -187,14 +190,129 @@ def metriques(y_true: np.ndarray, y_pred: np.ndarray) -> dict:
 
 
 # ─────────────────────────────────────────────
-# ENTRAÎNEMENT & ÉVALUATION
+# CACHE DES HYPERPARAMÈTRES
 # ─────────────────────────────────────────────
 
-def evaluer(df: pd.DataFrame, label: str, pipeline_imputer: bool) -> pd.DataFrame:
+_CACHE_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "resultats_modeles", "best_params.json",
+)
+
+
+def _lire_cache() -> dict:
+    """Charge le cache JSON des meilleurs hyperparamètres (dict nom → params)."""
+    if os.path.exists(_CACHE_PATH):
+        with open(_CACHE_PATH, encoding="utf-8") as f:
+            return json.load(f)
+    return {}
+
+
+def _maj_cache(nom: str, params: dict) -> None:
+    """Ajoute/met à jour les params d'un modèle dans le cache JSON."""
+    cache = _lire_cache()
+    cache[nom] = params
+    os.makedirs(os.path.dirname(_CACHE_PATH), exist_ok=True)
+    with open(_CACHE_PATH, "w", encoding="utf-8") as f:
+        json.dump(cache, f, indent=2, ensure_ascii=False)
+
+
+# ─────────────────────────────────────────────
+# WORKER (top-level pour être sérialisable par ProcessPoolExecutor)
+# ─────────────────────────────────────────────
+
+def _train_eval_modele(
+    nom: str,
+    modele,
+    param_grid: dict,
+    cached_params: dict | None,
+    X_train: np.ndarray,
+    X_test: np.ndarray,
+    y_train: np.ndarray,
+    y_test: np.ndarray,
+    seuil_proche: int,
+    label: str,
+    pipeline_imputer: bool,
+) -> dict:
     """
-    Entraîne tous les modèles sur df.
-    Pour chaque modèle ayant une entrée dans PARAM_GRIDS, un GridSearchCV (cv=3)
-    est d'abord lancé sur X_train pour trouver les meilleurs hyperparamètres.
+    Exécuté dans un process séparé.
+    - Si cached_params fourni  → on réutilise directement (pas de GridSearch).
+    - Si param_grid fourni     → GridSearchCV(n_jobs=1), résultats retournés
+                                  pour mise en cache côté main process.
+    - Sinon                    → fit direct (ex. LinearRegression).
+    """
+    import warnings
+    warnings.filterwarnings("ignore")
+
+    from sklearn.base import clone as sk_clone
+    from sklearn.model_selection import GridSearchCV
+    from sklearn.pipeline import Pipeline
+    from sklearn.impute import SimpleImputer
+    from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+
+    modele_clone     = sk_clone(modele)
+    meilleurs_params: dict = {}
+    gs_run = False
+
+    if cached_params:
+        # ── Params connus → on saute le GridSearch ────────────
+        modele_clone.set_params(**cached_params)
+        modele_clone.fit(X_train, y_train)
+        meilleurs_params = cached_params
+    elif param_grid:
+        # ── GridSearch ────────────────────────────────────────
+        gs = GridSearchCV(
+            sk_clone(modele_clone),
+            param_grid,
+            cv=3,
+            scoring="r2",
+            n_jobs=1,   # parallélisme géré par ProcessPoolExecutor en dehors
+        )
+        gs.fit(X_train, y_train)
+        meilleurs_params = gs.best_params_
+        modele_clone     = gs.best_estimator_
+        gs_run           = True
+    else:
+        if pipeline_imputer:
+            modele_clone = Pipeline([
+                ("imputer", SimpleImputer(strategy="mean")),
+                ("modele",  modele_clone),
+            ])
+        modele_clone.fit(X_train, y_train)
+
+    y_pred = np.asarray(modele_clone.predict(X_test), dtype=float)
+
+    mae   = mean_absolute_error(y_test, y_pred)
+    rmse  = float(np.sqrt(mean_squared_error(y_test, y_pred)))
+    r2    = r2_score(y_test, y_pred)
+    mask  = y_test != 0
+    mape  = (float(np.mean(np.abs((y_test[mask] - y_pred[mask]) / y_test[mask])) * 100)
+             if mask.sum() > 0 else float("nan"))
+    proche = float(np.mean(np.abs(y_test - y_pred) <= seuil_proche) * 100)
+
+    return {
+        "Modèle":            nom,
+        "Dataset":           label,
+        "MAE (s)":           mae,
+        "RMSE (s)":          rmse,
+        "R²":                r2,
+        "MAPE (%)":          mape,
+        f"Proche≤{seuil_proche}s (%)": proche,
+        "Meilleurs params":  str(meilleurs_params) if meilleurs_params else "—",
+        "_params_raw":       meilleurs_params,   # dict brut pour le cache
+        "_gs_run":           gs_run,             # True = GridSearch effectué
+    }
+
+
+# ─────────────────────────────────────────────
+# ENTRAÎNEMENT & ÉVALUATION (async)
+# ─────────────────────────────────────────────
+
+async def evaluer(df: pd.DataFrame, label: str, pipeline_imputer: bool) -> pd.DataFrame:
+    """
+    Lance tous les modèles en parallèle via ProcessPoolExecutor.
+    - Charge le cache JSON → si params déjà connus, GridSearch sauté.
+    - Affiche chaque modèle dès qu'il termine (asyncio.as_completed).
+    - Met à jour le cache JSON après chaque GridSearch réussi.
     """
     cols = [c for c in FEATURES if c in df.columns]
     X    = df[cols].values.astype(float)
@@ -204,50 +322,60 @@ def evaluer(df: pd.DataFrame, label: str, pipeline_imputer: bool) -> pd.DataFram
         X, y, test_size=TEST_SIZE, random_state=RANDOM_STATE
     )
 
+    cache = _lire_cache()
+    loop  = asyncio.get_event_loop()
+
+    avec_cache    = [nom for nom in MODELES if nom in cache]
+    sans_cache    = [nom for nom in MODELES if nom in PARAM_GRIDS and nom not in cache]
+    sans_grille   = [nom for nom in MODELES if nom not in PARAM_GRIDS]
+    print(f"  Cache     : {avec_cache  or '—'}")
+    print(f"  GridSearch: {sans_cache  or '—'}")
+    print(f"  Direct    : {sans_grille or '—'}")
+    print(f"  Lancement de {len(MODELES)} modèles en parallèle...\n")
+
+    executor = ProcessPoolExecutor()
+    # Associe chaque future au nom du modèle pour le message de progression
+    futures = {
+        loop.run_in_executor(
+            executor,
+            _train_eval_modele,
+            nom, modele,
+            PARAM_GRIDS.get(nom, {}),
+            cache.get(nom),           # None si pas en cache
+            X_train, X_test, y_train, y_test,
+            SEUIL_PROCHE_S, label, pipeline_imputer,
+        ): nom
+        for nom, modele in MODELES.items()
+    }
+
+    # ── Traitement au fil de l'eau ────────────────────────────
     proche_key = f"Proche≤{SEUIL_PROCHE_S}s (%)"
     lignes: list[dict] = []
 
-    for nom, modele in MODELES.items():
-        modele_clone = clone(modele)
-
-        # ── GridSearchCV si une grille est définie ────────────
-        meilleurs_params: dict = {}
-        if nom in PARAM_GRIDS:
-            print(f"  [GridSearch] {nom} ...", end=" ", flush=True)
-            gs = GridSearchCV(
-                clone(modele_clone),
-                PARAM_GRIDS[nom],
-                cv=3,
-                scoring="r2",
-                n_jobs=-1,
-            )
-            gs.fit(X_train, y_train)
-            meilleurs_params = gs.best_params_
-            modele_clone     = gs.best_estimator_
-            print(f"meilleurs params : {meilleurs_params}")
-        else:
-            # Pas de grille → entraînement direct (ex. LinearRegression)
-            if pipeline_imputer:
-                modele_clone = Pipeline([
-                    ("imputer", SimpleImputer(strategy="mean")),
-                    ("modele",  modele_clone),
-                ])
-            modele_clone.fit(X_train, y_train)
-
-        y_pred: np.ndarray = np.asarray(modele_clone.predict(X_test), dtype=float)
-
-        m = metriques(y_test, y_pred)
-        m["Modèle"]           = nom
-        m["Dataset"]          = label
-        m["Meilleurs params"] = str(meilleurs_params) if meilleurs_params else "—"
+    for future in asyncio.as_completed(futures):
+        m = await future
         lignes.append(m)
 
-        print(f"  [{label:<8}] {nom:<25}"
+        # Mise en cache si GridSearch vient d'être exécuté
+        if m["_gs_run"] and m["_params_raw"]:
+            _maj_cache(m["Modèle"], m["_params_raw"])
+            print(f"  [GridSearch OK] {m['Modèle']:<25} → params : {m['_params_raw']}")
+            print(f"                  cache mis à jour → {_CACHE_PATH}")
+        elif m["_params_raw"]:
+            print(f"  [Cache utilisé] {m['Modèle']:<25} → params : {m['_params_raw']}")
+
+        print(f"  [Terminé ✓]     {m['Modèle']:<25}"
               f"  MAE={m['MAE (s)']:8.1f}s"
               f"  RMSE={m['RMSE (s)']:8.1f}s"
               f"  R²={m['R²']:6.3f}"
-              f"  MAPE={m['MAPE (%)']:6.1f}%"
-              f"  Proche={m[proche_key]:5.1f}%")
+              f"  Proche={m[proche_key]:5.1f}%\n")
+
+    executor.shutdown(wait=False)
+
+    # Retirer les clés internes avant de retourner le DataFrame
+    for m in lignes:
+        m.pop("_params_raw", None)
+        m.pop("_gs_run",     None)
 
     return pd.DataFrame(lignes)
 
@@ -256,7 +384,7 @@ def evaluer(df: pd.DataFrame, label: str, pipeline_imputer: bool) -> pd.DataFram
 # MAIN
 # ─────────────────────────────────────────────
 
-def main():
+async def main():
     parser = argparse.ArgumentParser(description="Comparaison modèles régression — retard IDFM")
     parser.add_argument("--csv", default="dataset_predictions/passages_tglobal.csv",
                         help="Chemin vers le CSV source (brut ou post build_features)")
@@ -279,7 +407,7 @@ def main():
     print("\n" + "=" * 65)
     print("  DATASET CORRIGÉ  (features NaN imputées par la moyenne)")
     print("=" * 65)
-    res_b = evaluer(df_corrige, "Corrigé", pipeline_imputer=False)
+    res_b = await evaluer(df_corrige, "Corrigé", pipeline_imputer=False)
 
     proche_col = f"Proche≤{SEUIL_PROCHE_S}s (%)"
     # resultats = pd.concat([res_a, res_b], ...)  # réactiver quand expérience A relancée
@@ -328,4 +456,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
