@@ -17,7 +17,7 @@ import os
 
 import numpy as np
 import pandas as pd
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import train_test_split, GridSearchCV
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.pipeline import Pipeline
 from sklearn.impute import SimpleImputer
@@ -48,18 +48,55 @@ RANDOM_STATE = 42
 
 MODELES = {
     "LinearRegression":     LinearRegression(),
-    "Ridge":                Ridge(alpha=1.0),
-    "DecisionTree":         DecisionTreeRegressor(max_depth=10, random_state=RANDOM_STATE),
-    "RandomForest":         RandomForestRegressor(n_estimators=100, random_state=RANDOM_STATE, n_jobs=-1),
-    "ExtraTrees":           ExtraTreesRegressor(n_estimators=100, random_state=RANDOM_STATE, n_jobs=-1),
-    "GradientBoosting":     GradientBoostingRegressor(n_estimators=100, random_state=RANDOM_STATE),
-    "HistGradientBoosting": HistGradientBoostingRegressor(max_iter=100, random_state=RANDOM_STATE),
-    "KNeighbors(k=10)":     KNeighborsRegressor(n_neighbors=10, n_jobs=-1),
+    "Ridge":                Ridge(),
+    "DecisionTree":         DecisionTreeRegressor(random_state=RANDOM_STATE),
+    "RandomForest":         RandomForestRegressor(random_state=RANDOM_STATE, n_jobs=-1),
+    "ExtraTrees":           ExtraTreesRegressor(random_state=RANDOM_STATE, n_jobs=-1),
+    "GradientBoosting":     GradientBoostingRegressor(random_state=RANDOM_STATE),
+    "HistGradientBoosting": HistGradientBoostingRegressor(random_state=RANDOM_STATE),
+    "KNeighbors":           KNeighborsRegressor(n_jobs=-1),
 }
 
-# ─────────────────────────────────────────────
-# CHARGEMENT
-# ─────────────────────────────────────────────
+# Grilles d'hyperparamètres — GridSearchCV (cv=3, scoring=r2)
+# LinearRegression n'a pas d'hyperparamètre → exclu
+PARAM_GRIDS: dict[str, dict] = {
+    "Ridge": {
+        "alpha": [0.01, 0.1, 1.0, 10.0, 100.0],
+    },
+    # max_depth borné : None (sans limite) = overfitting assuré sur données réelles
+    "DecisionTree": {
+        "max_depth":         [3, 5, 8, 12, 18],
+        "min_samples_split": [2, 10, 50],
+        "min_samples_leaf":  [1, 5, 20],
+    },
+    "RandomForest": {
+        "n_estimators":     [100, 200],
+        "max_depth":        [5, 10, 15, 20],
+        "min_samples_leaf": [1, 5, 20],
+    },
+    "ExtraTrees": {
+        "n_estimators":     [100, 200],
+        "max_depth":        [5, 10, 15, 20],
+        "min_samples_leaf": [1, 5, 20],
+    },
+    "GradientBoosting": {
+        "n_estimators":  [100, 200],
+        "learning_rate": [0.05, 0.1, 0.2],
+        "max_depth":     [3, 5],
+    },
+    # HistGBM : max_depth=None autorisé car il régularise via max_leaf_nodes et l2
+    "HistGradientBoosting": {
+        "max_iter":        [100, 200],
+        "learning_rate":   [0.05, 0.1, 0.2],
+        "max_leaf_nodes":  [15, 31, 63],
+        "l2_regularization": [0.0, 0.1, 1.0],
+    },
+    "KNeighbors": {
+        "n_neighbors": [5, 10, 20, 50],
+        "weights":     ["uniform", "distance"],
+    },
+}
+
 
 def _encoder_categoriques(df: pd.DataFrame) -> pd.DataFrame:
     """
@@ -128,14 +165,25 @@ def charger(csv_path: str) -> tuple[pd.DataFrame, pd.DataFrame]:
 # MÉTRIQUES
 # ─────────────────────────────────────────────
 
+# Seuils de tolérance pour le taux de prédictions "proches"
+# ⚠ Si le dataset contient peu de retards réels (retard_sec ≈ 0 sur la majorité des
+#   lignes), R² sera artificiellement gonflé (un modèle qui prédit toujours 0 semble bon)
+#   et MAPE sera instable (division par ~0). Proche(%) est alors la métrique la plus
+#   fiable car elle mesure l'erreur absolue indépendamment de la distribution de la cible.
+SEUIL_PROCHE_S = 60   # prédiction considérée "proche" si |erreur| ≤ 60 secondes
+
+
 def metriques(y_true: np.ndarray, y_pred: np.ndarray) -> dict:
-    mae  = mean_absolute_error(y_true, y_pred)
-    rmse = np.sqrt(mean_squared_error(y_true, y_pred))
-    r2   = r2_score(y_true, y_pred)
-    mask = y_true != 0
-    mape = (np.mean(np.abs((y_true[mask] - y_pred[mask]) / y_true[mask])) * 100
-            if mask.sum() > 0 else float("nan"))
-    return {"MAE (s)": mae, "RMSE (s)": rmse, "R²": r2, "MAPE (%)": mape}
+    mae   = mean_absolute_error(y_true, y_pred)
+    rmse  = np.sqrt(mean_squared_error(y_true, y_pred))
+    r2    = r2_score(y_true, y_pred)
+    mask  = y_true != 0
+    mape  = (np.mean(np.abs((y_true[mask] - y_pred[mask]) / y_true[mask])) * 100
+             if mask.sum() > 0 else float("nan"))
+    # % de prédictions à moins de SEUIL_PROCHE_S secondes de la vraie valeur
+    proche = float(np.mean(np.abs(y_true - y_pred) <= SEUIL_PROCHE_S) * 100)
+    return {"MAE (s)": mae, "RMSE (s)": rmse, "R²": r2, "MAPE (%)": mape,
+            f"Proche≤{SEUIL_PROCHE_S}s (%)": proche}
 
 
 # ─────────────────────────────────────────────
@@ -144,11 +192,9 @@ def metriques(y_true: np.ndarray, y_pred: np.ndarray) -> dict:
 
 def evaluer(df: pd.DataFrame, label: str, pipeline_imputer: bool) -> pd.DataFrame:
     """
-    Entraîne tous les modèles sur df, affiche et retourne les métriques.
-
-    pipeline_imputer=True  → SimpleImputer(mean) dans le Pipeline (expérience A)
-                             HistGradientBoosting gère les NaN nativement (pas de pipeline)
-    pipeline_imputer=False → modèle direct, aucun NaN attendu (expérience B)
+    Entraîne tous les modèles sur df.
+    Pour chaque modèle ayant une entrée dans PARAM_GRIDS, un GridSearchCV (cv=3)
+    est d'abord lancé sur X_train pour trouver les meilleurs hyperparamètres.
     """
     cols = [c for c in FEATURES if c in df.columns]
     X    = df[cols].values.astype(float)
@@ -158,31 +204,50 @@ def evaluer(df: pd.DataFrame, label: str, pipeline_imputer: bool) -> pd.DataFram
         X, y, test_size=TEST_SIZE, random_state=RANDOM_STATE
     )
 
-    lignes = []
+    proche_key = f"Proche≤{SEUIL_PROCHE_S}s (%)"
+    lignes: list[dict] = []
+
     for nom, modele in MODELES.items():
         modele_clone = clone(modele)
 
-        if pipeline_imputer and nom != "HistGradientBoosting":
-            estimateur = Pipeline([
-                ("imputer", SimpleImputer(strategy="mean")),
-                ("modele",  modele_clone),
-            ])
+        # ── GridSearchCV si une grille est définie ────────────
+        meilleurs_params: dict = {}
+        if nom in PARAM_GRIDS:
+            print(f"  [GridSearch] {nom} ...", end=" ", flush=True)
+            gs = GridSearchCV(
+                clone(modele_clone),
+                PARAM_GRIDS[nom],
+                cv=3,
+                scoring="r2",
+                n_jobs=-1,
+            )
+            gs.fit(X_train, y_train)
+            meilleurs_params = gs.best_params_
+            modele_clone     = gs.best_estimator_
+            print(f"meilleurs params : {meilleurs_params}")
         else:
-            estimateur = modele_clone
+            # Pas de grille → entraînement direct (ex. LinearRegression)
+            if pipeline_imputer:
+                modele_clone = Pipeline([
+                    ("imputer", SimpleImputer(strategy="mean")),
+                    ("modele",  modele_clone),
+                ])
+            modele_clone.fit(X_train, y_train)
 
-        estimateur.fit(X_train, y_train)
-        y_pred: np.ndarray = np.asarray(estimateur.predict(X_test), dtype=float)
+        y_pred: np.ndarray = np.asarray(modele_clone.predict(X_test), dtype=float)
 
         m = metriques(y_test, y_pred)
-        m["Modèle"]  = nom
-        m["Dataset"] = label
+        m["Modèle"]           = nom
+        m["Dataset"]          = label
+        m["Meilleurs params"] = str(meilleurs_params) if meilleurs_params else "—"
         lignes.append(m)
 
         print(f"  [{label:<8}] {nom:<25}"
               f"  MAE={m['MAE (s)']:8.1f}s"
               f"  RMSE={m['RMSE (s)']:8.1f}s"
               f"  R²={m['R²']:6.3f}"
-              f"  MAPE={m['MAPE (%)']:6.1f}%")
+              f"  MAPE={m['MAPE (%)']:6.1f}%"
+              f"  Proche={m[proche_key]:5.1f}%")
 
     return pd.DataFrame(lignes)
 
@@ -200,47 +265,66 @@ def main():
     print("=" * 65)
     print("  CHARGEMENT & PRÉPARATION")
     print("=" * 65)
-    df_brut, df_corrige = charger(args.csv)
+    # df_brut est conservé pour une future expérience A (NaN features → SimpleImputer)
+    _df_brut, df_corrige = charger(args.csv)
     print(f"  Features : {FEATURES}")
     print(f"  Split    : {int((1 - TEST_SIZE) * 100)}/{int(TEST_SIZE * 100)}")
 
-    print("\n" + "=" * 65)
-    print("  EXPÉRIENCE A — Dataset BRUT  (NaN features → SimpleImputer / HistGBM natif)")
-    print("=" * 65)
-    res_a = evaluer(df_brut, "Brut", pipeline_imputer=True)
+    # ── Expérience A désactivée (dataset brut, NaN dans les features) ────────
+    # print("\n" + "=" * 65)
+    # print("  EXPÉRIENCE A — Dataset BRUT  (NaN features → SimpleImputer / HistGBM natif)")
+    # print("=" * 65)
+    # res_a = evaluer(_df_brut, "Brut", pipeline_imputer=True)
 
     print("\n" + "=" * 65)
-    print("  EXPÉRIENCE B — Dataset CORRIGÉ  (imputation mean des features appliquée)")
+    print("  DATASET CORRIGÉ  (features NaN imputées par la moyenne)")
     print("=" * 65)
     res_b = evaluer(df_corrige, "Corrigé", pipeline_imputer=False)
 
-    # ── Score composite : R² (qualité globale) + RMSE inversé (pénalise les grandes erreurs)
-    # Normalisation min-max sur l'ensemble des résultats puis moyenne pondérée 50/50.
-    # RMSE est inversé car une valeur basse est meilleure.
-    resultats = pd.concat([res_a, res_b], ignore_index=True)
-    resultats = resultats[["Dataset", "Modèle", "MAE (s)", "RMSE (s)", "R²", "MAPE (%)"]]
+    proche_col = f"Proche≤{SEUIL_PROCHE_S}s (%)"
+    # resultats = pd.concat([res_a, res_b], ...)  # réactiver quand expérience A relancée
+    resultats  = res_b.copy()
+    resultats  = resultats[["Dataset", "Modèle", "MAE (s)", "RMSE (s)", "R²",
+                             "MAPE (%)", proche_col, "Meilleurs params"]]
 
-    rmse_min, rmse_max = resultats["RMSE (s)"].min(), resultats["RMSE (s)"].max()
-    r2_min,   r2_max   = resultats["R²"].min(),       resultats["R²"].max()
-    rmse_norm = (resultats["RMSE (s)"] - rmse_min) / (rmse_max - rmse_min + 1e-9)
-    r2_norm   = (resultats["R²"]       - r2_min)   / (r2_max   - r2_min   + 1e-9)
-    resultats["Score"] = (0.5 * r2_norm + 0.5 * (1.0 - rmse_norm)).round(4)
+    # ── Affichage par métrique ────────────────────────────────
+    metriques_tri = [
+        ("R²",         True,  "R² (plus élevé = mieux)"),
+        ("MAE (s)",    False, "MAE — erreur moyenne absolue (plus bas = mieux)"),
+        ("RMSE (s)",   False, "RMSE — pénalise les grandes erreurs (plus bas = mieux)"),
+        (proche_col,   True,  f"Proche≤{SEUIL_PROCHE_S}s — % prédictions proches (plus élevé = mieux)"),
+    ]
+    for col, desc_asc, titre in metriques_tri:
+        tri = resultats.sort_values(col, ascending=not desc_asc).reset_index(drop=True)
+        tri.insert(0, "Rang", range(1, len(tri) + 1))
+        print(f"\n{'=' * 70}")
+        print(f"  {titre}")
+        print("=" * 70)
+        print(tri[["Rang", "Dataset", "Modèle", col]].to_string(index=False))
 
-    resultats = resultats.sort_values("Score", ascending=False).reset_index(drop=True)
+    from datetime import datetime
+    from rapport import ecrire_rapport  # type: ignore
 
-    print("\n" + "=" * 65)
-    print("  RÉSULTATS COMPARATIFS (trié par Score = R²·50% + RMSE·50% inversé)")
-    print("=" * 65)
-    print(resultats.to_string(index=False, float_format=lambda x: f"{x:>9.3f}"))
+    dossier = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                           "resultats_modeles")
+    os.makedirs(dossier, exist_ok=True)
+    horodatage = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    best = resultats.iloc[0]
-    print(f"\n>>> Meilleur modèle : [{best['Dataset']}] {best['Modèle']}"
-          f"  Score={best['Score']:.4f}  R²={best['R²']:.4f}"
-          f"  MAE={best['MAE (s)']:.1f}s  RMSE={best['RMSE (s)']:.1f}s")
+    out_csv = os.path.join(dossier, f"resultats_{horodatage}.csv")
+    resultats.to_csv(out_csv, index=False)
+    print(f"\nRésultats CSV    → {out_csv}")
 
-    out = os.path.join(os.path.dirname(args.csv), "resultats_modeles.csv")
-    resultats.to_csv(out, index=False)
-    print(f"\nRésultats exportés → {out}")
+    out_md = ecrire_rapport(
+        resultats   = resultats,
+        dossier     = dossier,
+        horodatage  = horodatage,
+        csv_source  = args.csv,
+        n_lignes    = len(df_corrige),
+        features    = FEATURES,
+        test_size   = TEST_SIZE,
+        seuil_proche= SEUIL_PROCHE_S,
+    )
+    print(f"Rapport Markdown → {out_md}")
 
 
 if __name__ == "__main__":

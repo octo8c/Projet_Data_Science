@@ -366,7 +366,7 @@ def build_features(csv_path: str = CSV_FILE) -> pd.DataFrame:
         usecols=['LIBELLE_ARRET', 'CAT_JOUR', 'HEURE', 'NB_ENTREES_HEURE'],
     ).dropna(subset=['LIBELLE_ARRET', 'HEURE'])
     df_occ['_nom']  = df_occ['LIBELLE_ARRET'].str.upper().str.strip()
-    df_occ['HEURE'] = df_occ['HEURE'].astype(int)
+    df_occ['HEURE'] = df_occ['HEURE'].astype('Int64')
 
     df_ar = pd.read_csv("dataset_other/arrets .csv", sep=';', low_memory=False,
                         usecols=['ArRId', 'ArRName'])
@@ -374,7 +374,7 @@ def build_features(csv_path: str = CSV_FILE) -> pd.DataFrame:
     df_ar['_nom']   = df_ar['ArRName'].str.upper().str.strip()
 
     df['_ArRId']   = df['stop_ref'].astype(str).str.extract(r':(?:Q|BP):(\d+):').astype('Int64')
-    df['_heure']   = ref_dt.dt.hour.astype(int)
+    df['_heure']   = ref_dt.dt.hour.astype('Int64')
     df['_cat_jour'] = df.apply(
         lambda r: _cat_jour(str(r.get('date_course', '')),
                             pd.Timestamp(r['date_course']).weekday()
@@ -414,8 +414,7 @@ def impute_missing(df: pd.DataFrame) -> pd.DataFrame:
       C — occupation : moyenne par (nom_ligne, heure_tranche) → SimpleImputer global
       B — retard_sec : IterativeImputer (RandomForest) sur features numériques
     """
-    from sklearn.impute import SimpleImputer, IterativeImputer
-    from sklearn.ensemble import RandomForestRegressor
+    from sklearn.impute import SimpleImputer
 
     # ── C : meteo ────────────────────────────────────────────
     df['meteo'] = df['meteo'].fillna('Inconnu')
