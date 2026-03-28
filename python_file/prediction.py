@@ -1,14 +1,17 @@
 """
 prediction.py — Comparaison de modèles de régression pour la prédiction du retard.
 
-Deux expériences :
-  A) Dataset BRUT    : features avec NaN → SimpleImputer(mean) dans le Pipeline
-                       + HistGradientBoosting qui gère les NaN nativement
-  B) Dataset CORRIGÉ : imputation mean des features NaN appliquée en amont
+Le dataset d'entrée doit être ML-ready (produit par build_dataset.py --preparer ou
+--snapshot) : toutes les colonnes sont numériques, les catégorielles sont déjà encodées
+en entiers, les NaN sont imputés.
+
+Évaluation :
+  - Hyperparamètres : GridSearchCV (cv=3, scoring=r²) sur l'ensemble complet
+  - Métriques finales : KFold k=5 (shuffle, random_state=42) → moyenne ± écart-type
 
 Usage :
-    python prediction.py --csv dataset_predictions/passages_tglobal.csv
-    python prediction.py --csv dataset_predictions/dataset_final.csv
+    python prediction.py --csv dataset_predictions/dataset_ml.csv
+    python prediction.py          # snapshot API temps réel → ML-ready → entraînement
 """
 
 import argparse
@@ -16,15 +19,18 @@ import asyncio
 import json
 import warnings
 import os
+import sys
 from concurrent.futures import ProcessPoolExecutor
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from build_dataset import (
+    preparer_ml,
+    collecter_snapshot_ml,
+    ML_COLONNES,
+)
 
 import numpy as np
 import pandas as pd
-from sklearn.model_selection import train_test_split, GridSearchCV
-from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
-from sklearn.pipeline import Pipeline
-from sklearn.impute import SimpleImputer
-from sklearn.base import clone
 from sklearn.linear_model import LinearRegression, Ridge
 from sklearn.tree import DecisionTreeRegressor
 from sklearn.ensemble import (
@@ -42,12 +48,19 @@ warnings.filterwarnings("ignore")
 # ─────────────────────────────────────────────
 
 TARGET       = "retard_sec"
-FEATURES_CAT = ["nom_ligne", "jour_semaine", "periode_journee", "meteo"]
-FEATURES_NUM = ["heure_tranche", "mois", "jour_ferie", "occupation"]
-FEATURES     = FEATURES_CAT + FEATURES_NUM
+FEATURES_CAT = ["nom_ligne", "jour_semaine", "periode_journee", "meteo_groupe", "categorie_alerte"]
+FEATURES_NUM = [
+    "heure_tranche", "mois", "jour_ferie", "occupation",
+    "direction_ref", "terminus_encoded",
+    "precipitation", "snowfall", "wind_speed", "temperature",
+]
+FEATURES = FEATURES_CAT + FEATURES_NUM
 
-TEST_SIZE    = 0.20
+N_FOLDS      = 5    # KFold k=5 pour l'évaluation finale
 RANDOM_STATE = 42
+
+# Seuil de tolérance : prédiction "proche" si |erreur| ≤ 60 secondes
+SEUIL_PROCHE_S = 60
 
 MODELES = {
     "LinearRegression":     LinearRegression(),
@@ -60,13 +73,10 @@ MODELES = {
     "KNeighbors":           KNeighborsRegressor(n_jobs=-1),
 }
 
-# Grilles d'hyperparamètres — GridSearchCV (cv=3, scoring=r2)
-# LinearRegression n'a pas d'hyperparamètre → exclu
 PARAM_GRIDS: dict[str, dict] = {
     "Ridge": {
         "alpha": [0.01, 0.1, 1.0, 10.0, 100.0],
     },
-    # max_depth borné : None (sans limite) = overfitting assuré sur données réelles
     "DecisionTree": {
         "max_depth":         [3, 5, 8, 12, 18],
         "min_samples_split": [2, 10, 50],
@@ -87,11 +97,10 @@ PARAM_GRIDS: dict[str, dict] = {
         "learning_rate": [0.05, 0.1, 0.2],
         "max_depth":     [3, 5],
     },
-    # HistGBM : max_depth=None autorisé car il régularise via max_leaf_nodes et l2
     "HistGradientBoosting": {
-        "max_iter":        [100, 200],
-        "learning_rate":   [0.05, 0.1, 0.2],
-        "max_leaf_nodes":  [15, 31, 63],
+        "max_iter":          [100, 200],
+        "learning_rate":     [0.05, 0.1, 0.2],
+        "max_leaf_nodes":    [15, 31, 63],
         "l2_regularization": [0.0, 0.1, 1.0],
     },
     "KNeighbors": {
@@ -101,92 +110,59 @@ PARAM_GRIDS: dict[str, dict] = {
 }
 
 
-def _encoder_categoriques(df: pd.DataFrame) -> pd.DataFrame:
+# ─────────────────────────────────────────────
+# CHARGEMENT DES DONNÉES
+# ─────────────────────────────────────────────
+
+def charger(csv_path: str) -> pd.DataFrame:
     """
-    Encode les colonnes catégorielles via pandas Categorical (sans sklearn).
-    Les NaN et valeurs vides sont regroupés sous '_inconnu'.
-    Retourne un DataFrame avec les colonnes catégorielles remplacées par des entiers.
+    Charge un CSV ML-ready produit par build_dataset.py.
+    Si le CSV est brut (colonnes horaires présentes), appelle preparer_ml() à la volée.
+
+    Retourne un DataFrame contenant TARGET + FEATURES, sans NaN, prêt pour sklearn.
     """
-    df = df.copy()
-    for col in FEATURES_CAT:
-        if col not in df.columns:
-            df[col] = 0
+    import csv as _csv_mod
+
+    with open(csv_path, "r", encoding="utf-8-sig", errors="replace") as _f:
+        header = next(_csv_mod.reader(_f))
+
+    if set(ML_COLONNES).issubset(set(header)):
+        df = pd.read_csv(csv_path, low_memory=False)
+    else:
+        print(f"  CSV brut détecté ({len(header)} cols) — application du pipeline ML…")
+        df = preparer_ml(csv_path)
+
+    df[TARGET] = pd.to_numeric(df[TARGET], errors="coerce")
+    avant = len(df)
+    df = df.dropna(subset=[TARGET]).reset_index(drop=True)
+    print(f"  Lignes conservées (retard_sec calculable) : {len(df):,} / {avant:,}")
+
+    for col in FEATURES:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
         else:
-            serie = df[col].fillna("_inconnu").astype(str).str.strip()
-            serie = serie.where(serie != "", other="_inconnu")
-            df[col] = serie.astype("category").cat.codes
+            df[col] = 0.0
+
     return df
 
 
-def charger(csv_path: str) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    Charge le CSV, calcule retard_sec et retourne (df_brut, df_corrige).
+def _charger_api() -> pd.DataFrame:
+    """Snapshot API temps réel → DataFrame ML-ready."""
+    print("  Mode API temps réel (snapshot unique)")
+    df = collecter_snapshot_ml(output_ml=None)
 
-    - Filtre uniquement les lignes où la cible n'est pas calculable.
-    - Encode les catégorielles via pandas (pas de sklearn).
-    - df_brut    : features numériques telles quelles (NaN possibles)
-    - df_corrige : NaN des features numériques remplacés par la moyenne
-    """
-    df = pd.read_csv(csv_path, low_memory=False)
-
-    # ── Calcul de la cible ───────────────────────────────────
-    arr_est  = pd.to_datetime(df["horaire_arrivee_estime"], utc=True, errors="coerce")
-    arr_prev = pd.to_datetime(df["horaire_arrivee_prevu"],  utc=True, errors="coerce")
-    df[TARGET] = (arr_est - arr_prev).dt.total_seconds().round()
-
+    df[TARGET] = pd.to_numeric(df[TARGET], errors="coerce")
     avant = len(df)
     df = df.dropna(subset=[TARGET]).reset_index(drop=True)
-    print(f"  Lignes supprimées (cible non calculable) : {avant - len(df):,}")
-    print(f"  Lignes conservées                        : {len(df):,}")
+    print(f"  Lignes avec retard calculable : {len(df):,} / {avant:,}")
 
-    # ── Typage des features numériques ──────────────────────
-    for col in FEATURES_NUM:
+    for col in FEATURES:
         if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
+            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
         else:
-            df[col] = np.nan
+            df[col] = 0.0
 
-    # ── Encodage des catégorielles ───────────────────────────
-    df = _encoder_categoriques(df)
-
-    # ── df_brut : NaN features conservés (expérience A) ─────
-    df_brut = df.copy()
-
-    # ── df_corrige : imputation mean features (expérience B) ─
-    df_corrige = df.copy()
-    for col in FEATURES_NUM:
-        if df_corrige[col].isna().any():
-            mean_val = df_corrige[col].mean()
-            df_corrige[col] = df_corrige[col].fillna(
-                mean_val if pd.notna(mean_val) else 0.0
-            )
-
-    return df_brut, df_corrige
-
-
-# ─────────────────────────────────────────────
-# MÉTRIQUES
-# ─────────────────────────────────────────────
-
-# Seuils de tolérance pour le taux de prédictions "proches"
-# ⚠ Si le dataset contient peu de retards réels (retard_sec ≈ 0 sur la majorité des
-#   lignes), R² sera artificiellement gonflé (un modèle qui prédit toujours 0 semble bon)
-#   et MAPE sera instable (division par ~0). Proche(%) est alors la métrique la plus
-#   fiable car elle mesure l'erreur absolue indépendamment de la distribution de la cible.
-SEUIL_PROCHE_S = 60   # prédiction considérée "proche" si |erreur| ≤ 60 secondes
-
-
-def metriques(y_true: np.ndarray, y_pred: np.ndarray) -> dict:
-    mae   = mean_absolute_error(y_true, y_pred)
-    rmse  = np.sqrt(mean_squared_error(y_true, y_pred))
-    r2    = r2_score(y_true, y_pred)
-    mask  = y_true != 0
-    mape  = (np.mean(np.abs((y_true[mask] - y_pred[mask]) / y_true[mask])) * 100
-             if mask.sum() > 0 else float("nan"))
-    # % de prédictions à moins de SEUIL_PROCHE_S secondes de la vraie valeur
-    proche = float(np.mean(np.abs(y_true - y_pred) <= SEUIL_PROCHE_S) * 100)
-    return {"MAE (s)": mae, "RMSE (s)": rmse, "R²": r2, "MAPE (%)": mape,
-            f"Proche≤{SEUIL_PROCHE_S}s (%)": proche}
+    return df
 
 
 # ─────────────────────────────────────────────
@@ -200,7 +176,6 @@ _CACHE_PATH = os.path.join(
 
 
 def _lire_cache() -> dict:
-    """Charge le cache JSON des meilleurs hyperparamètres (dict nom → params)."""
     if os.path.exists(_CACHE_PATH):
         with open(_CACHE_PATH, encoding="utf-8") as f:
             return json.load(f)
@@ -208,7 +183,6 @@ def _lire_cache() -> dict:
 
 
 def _maj_cache(nom: str, params: dict) -> None:
-    """Ajoute/met à jour les params d'un modèle dans le cache JSON."""
     cache = _lire_cache()
     cache[nom] = params
     os.makedirs(os.path.dirname(_CACHE_PATH), exist_ok=True)
@@ -217,7 +191,7 @@ def _maj_cache(nom: str, params: dict) -> None:
 
 
 # ─────────────────────────────────────────────
-# WORKER (top-level pour être sérialisable par ProcessPoolExecutor)
+# WORKER (top-level pour ProcessPoolExecutor)
 # ─────────────────────────────────────────────
 
 def _train_eval_modele(
@@ -225,81 +199,87 @@ def _train_eval_modele(
     modele,
     param_grid: dict,
     cached_params: dict | None,
-    X_train: np.ndarray,
-    X_test: np.ndarray,
-    y_train: np.ndarray,
-    y_test: np.ndarray,
+    X: np.ndarray,
+    y: np.ndarray,
     seuil_proche: int,
     label: str,
-    pipeline_imputer: bool,
+    n_folds: int,
 ) -> dict:
     """
     Exécuté dans un process séparé.
-    - Si cached_params fourni  → on réutilise directement (pas de GridSearch).
-    - Si param_grid fourni     → GridSearchCV(n_jobs=1), résultats retournés
-                                  pour mise en cache côté main process.
-    - Sinon                    → fit direct (ex. LinearRegression).
+
+    Phase 1 — Hyperparamètres :
+      - cached_params fourni → réutilisés directement (pas de GridSearch)
+      - param_grid fourni    → GridSearchCV(cv=3, scoring=r²) sur l'ensemble complet
+      - ni l'un ni l'autre   → fit direct (ex. LinearRegression)
+
+    Phase 2 — Évaluation KFold k=n_folds :
+      Pour chaque fold : entraîne avec les meilleurs params → prédit → calcule métriques.
+      Retourne moyenne ± écart-type de chaque métrique sur les n_folds folds.
     """
     import warnings
     warnings.filterwarnings("ignore")
 
+    import numpy as _np
     from sklearn.base import clone as sk_clone
-    from sklearn.model_selection import GridSearchCV
-    from sklearn.pipeline import Pipeline
-    from sklearn.impute import SimpleImputer
+    from sklearn.model_selection import GridSearchCV, KFold
     from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 
-    modele_clone     = sk_clone(modele)
-    meilleurs_params: dict = {}
+    proche_key = f"Proche≤{seuil_proche}s (%)"
+
+    # ── Phase 1 : recherche des meilleurs hyperparamètres ────────
+    best_params: dict = {}
     gs_run = False
 
     if cached_params:
-        # ── Params connus → on saute le GridSearch ────────────
-        modele_clone.set_params(**cached_params)
-        modele_clone.fit(X_train, y_train)
-        meilleurs_params = cached_params
+        best_params = cached_params
     elif param_grid:
-        # ── GridSearch ────────────────────────────────────────
-        gs = GridSearchCV(
-            sk_clone(modele_clone),
-            param_grid,
-            cv=3,
-            scoring="r2",
-            n_jobs=1,   # parallélisme géré par ProcessPoolExecutor en dehors
-        )
-        gs.fit(X_train, y_train)
-        meilleurs_params = gs.best_params_
-        modele_clone     = gs.best_estimator_
-        gs_run           = True
-    else:
-        if pipeline_imputer:
-            modele_clone = Pipeline([
-                ("imputer", SimpleImputer(strategy="mean")),
-                ("modele",  modele_clone),
-            ])
-        modele_clone.fit(X_train, y_train)
+        gs = GridSearchCV(sk_clone(modele), param_grid, cv=3, scoring="r2", n_jobs=1)
+        gs.fit(X, y)
+        best_params = gs.best_params_
+        gs_run = True
 
-    y_pred = np.asarray(modele_clone.predict(X_test), dtype=float)
+    # ── Phase 2 : évaluation KFold k=n_folds ─────────────────────
+    kf = KFold(n_splits=n_folds, shuffle=True, random_state=42)
 
-    mae   = mean_absolute_error(y_test, y_pred)
-    rmse  = float(np.sqrt(mean_squared_error(y_test, y_pred)))
-    r2    = r2_score(y_test, y_pred)
-    mask  = y_test != 0
-    mape  = (float(np.mean(np.abs((y_test[mask] - y_pred[mask]) / y_test[mask])) * 100)
-             if mask.sum() > 0 else float("nan"))
-    proche = float(np.mean(np.abs(y_test - y_pred) <= seuil_proche) * 100)
+    maes, rmses, r2s, mapes, proches = [], [], [], [], []
+
+    for train_idx, test_idx in kf.split(X):
+        X_tr, X_te = X[train_idx], X[test_idx]
+        y_tr, y_te = y[train_idx], y[test_idx]
+
+        m = sk_clone(modele)
+        if best_params:
+            m.set_params(**best_params)
+        m.fit(X_tr, y_tr)
+        y_pred = _np.asarray(m.predict(X_te), dtype=float)
+
+        maes.append(mean_absolute_error(y_te, y_pred))
+        rmses.append(float(_np.sqrt(mean_squared_error(y_te, y_pred))))
+        r2s.append(r2_score(y_te, y_pred))
+
+        mask = y_te != 0
+        if mask.sum() > 0:
+            mapes.append(float(_np.mean(_np.abs((y_te[mask] - y_pred[mask]) / y_te[mask])) * 100))
+
+        proches.append(float(_np.mean(_np.abs(y_te - y_pred) <= seuil_proche) * 100))
 
     return {
         "Modèle":            nom,
         "Dataset":           label,
-        "MAE (s)":           mae,
-        "RMSE (s)":          rmse,
-        "R²":                r2,
-        "MAPE (%)":          mape,
-        f"Proche≤{seuil_proche}s (%)": proche,
-        "Meilleurs params":  str(meilleurs_params) if meilleurs_params else "—",
-        "_params_raw":       meilleurs_params,   # dict brut pour le cache
-        "_gs_run":           gs_run,             # True = GridSearch effectué
+        "MAE (s)":           float(_np.mean(maes)),
+        "MAE (s) ±":         float(_np.std(maes)),
+        "RMSE (s)":          float(_np.mean(rmses)),
+        "RMSE (s) ±":        float(_np.std(rmses)),
+        "R²":                float(_np.mean(r2s)),
+        "R² ±":              float(_np.std(r2s)),
+        "MAPE (%)":          float(_np.mean(mapes))  if mapes  else float("nan"),
+        "MAPE (%) ±":        float(_np.std(mapes))   if mapes  else float("nan"),
+        proche_key:          float(_np.mean(proches)),
+        proche_key + " ±":   float(_np.std(proches)),
+        "Meilleurs params":  str(best_params) if best_params else "—",
+        "_params_raw":       best_params,
+        "_gs_run":           gs_run,
     }
 
 
@@ -307,48 +287,46 @@ def _train_eval_modele(
 # ENTRAÎNEMENT & ÉVALUATION (async)
 # ─────────────────────────────────────────────
 
-async def evaluer(df: pd.DataFrame, label: str, pipeline_imputer: bool) -> pd.DataFrame:
+async def evaluer(df: pd.DataFrame, label: str) -> pd.DataFrame:
     """
     Lance tous les modèles en parallèle via ProcessPoolExecutor.
-    - Charge le cache JSON → si params déjà connus, GridSearch sauté.
-    - Affiche chaque modèle dès qu'il termine (asyncio.as_completed).
-    - Met à jour le cache JSON après chaque GridSearch réussi.
+
+    Pour chaque modèle :
+      1. GridSearchCV (cv=3) pour trouver les meilleurs hyperparamètres (ou cache)
+      2. KFold k=N_FOLDS pour obtenir des métriques robustes (moyenne ± std)
+
+    Le dataset est supposé ML-ready : toutes les features numériques, sans NaN.
     """
     cols = [c for c in FEATURES if c in df.columns]
     X    = df[cols].values.astype(float)
-    y: np.ndarray = df[TARGET].to_numpy(dtype=float)
-
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=TEST_SIZE, random_state=RANDOM_STATE
-    )
+    y    = df[TARGET].to_numpy(dtype=float)
 
     cache = _lire_cache()
     loop  = asyncio.get_event_loop()
 
-    avec_cache    = [nom for nom in MODELES if nom in cache]
-    sans_cache    = [nom for nom in MODELES if nom in PARAM_GRIDS and nom not in cache]
-    sans_grille   = [nom for nom in MODELES if nom not in PARAM_GRIDS]
+    avec_cache  = [nom for nom in MODELES if nom in cache]
+    sans_cache  = [nom for nom in MODELES if nom in PARAM_GRIDS and nom not in cache]
+    sans_grille = [nom for nom in MODELES if nom not in PARAM_GRIDS]
     print(f"  Cache     : {avec_cache  or '—'}")
     print(f"  GridSearch: {sans_cache  or '—'}")
     print(f"  Direct    : {sans_grille or '—'}")
-    print(f"  Lancement de {len(MODELES)} modèles en parallèle...\n")
+    print(f"  Évaluation : KFold k={N_FOLDS}  ({len(X):,} lignes)")
+    print(f"  Lancement de {len(MODELES)} modèles en parallèle…\n")
 
     executor = ProcessPoolExecutor()
-    # Associe chaque future au nom du modèle pour le message de progression
     futures = {
         loop.run_in_executor(
             executor,
             _train_eval_modele,
             nom, modele,
             PARAM_GRIDS.get(nom, {}),
-            cache.get(nom),           # None si pas en cache
-            X_train, X_test, y_train, y_test,
-            SEUIL_PROCHE_S, label, pipeline_imputer,
+            cache.get(nom),
+            X, y,
+            SEUIL_PROCHE_S, label, N_FOLDS,
         ): nom
         for nom, modele in MODELES.items()
     }
 
-    # ── Traitement au fil de l'eau ────────────────────────────
     proche_key = f"Proche≤{SEUIL_PROCHE_S}s (%)"
     lignes: list[dict] = []
 
@@ -356,7 +334,6 @@ async def evaluer(df: pd.DataFrame, label: str, pipeline_imputer: bool) -> pd.Da
         m = await future
         lignes.append(m)
 
-        # Mise en cache si GridSearch vient d'être exécuté
         if m["_gs_run"] and m["_params_raw"]:
             _maj_cache(m["Modèle"], m["_params_raw"])
             print(f"  [GridSearch OK] {m['Modèle']:<25} → params : {m['_params_raw']}")
@@ -364,15 +341,15 @@ async def evaluer(df: pd.DataFrame, label: str, pipeline_imputer: bool) -> pd.Da
         elif m["_params_raw"]:
             print(f"  [Cache utilisé] {m['Modèle']:<25} → params : {m['_params_raw']}")
 
-        print(f"  [Terminé ✓]     {m['Modèle']:<25}"
-              f"  MAE={m['MAE (s)']:8.1f}s"
-              f"  RMSE={m['RMSE (s)']:8.1f}s"
-              f"  R²={m['R²']:6.3f}"
-              f"  Proche={m[proche_key]:5.1f}%\n")
+        print(
+            f"  [Terminé ✓]     {m['Modèle']:<25}"
+            f"  MAE={m['MAE (s)']:7.1f}±{m['MAE (s) ±']:5.1f}s"
+            f"  R²={m['R²']:6.3f}±{m['R² ±']:.3f}"
+            f"  Proche={m[proche_key]:5.1f}±{m[proche_key + ' ±']:4.1f}%\n"
+        )
 
     executor.shutdown(wait=False)
 
-    # Retirer les clés internes avant de retourner le DataFrame
     for m in lignes:
         m.pop("_params_raw", None)
         m.pop("_gs_run",     None)
@@ -385,56 +362,78 @@ async def evaluer(df: pd.DataFrame, label: str, pipeline_imputer: bool) -> pd.Da
 # ─────────────────────────────────────────────
 
 async def main():
+    """
+    Usage :
+        python prediction.py                          # snapshot API temps réel
+        python prediction.py --csv dataset_ml.csv    # CSV ML-ready déjà préparé
+        python prediction.py --csv passages.csv       # CSV brut (préparation auto)
+    """
     parser = argparse.ArgumentParser(description="Comparaison modèles régression — retard IDFM")
-    parser.add_argument("--csv", default="dataset_predictions/passages_tglobal.csv",
-                        help="Chemin vers le CSV source (brut ou post build_features)")
+    parser.add_argument(
+        "--csv", default=None,
+        help="CSV source ML-ready ou brut. Si absent : snapshot API temps réel.",
+    )
     args = parser.parse_args()
 
     print("=" * 65)
     print("  CHARGEMENT & PRÉPARATION")
     print("=" * 65)
-    # df_brut est conservé pour une future expérience A (NaN features → SimpleImputer)
-    _df_brut, df_corrige = charger(args.csv)
-    print(f"  Features : {FEATURES}")
-    print(f"  Split    : {int((1 - TEST_SIZE) * 100)}/{int(TEST_SIZE * 100)}")
 
-    # ── Expérience A désactivée (dataset brut, NaN dans les features) ────────
-    # print("\n" + "=" * 65)
-    # print("  EXPÉRIENCE A — Dataset BRUT  (NaN features → SimpleImputer / HistGBM natif)")
-    # print("=" * 65)
-    # res_a = evaluer(_df_brut, "Brut", pipeline_imputer=True)
+    if args.csv:
+        df = charger(args.csv)
+    else:
+        df = _charger_api()
+
+    if len(df) < N_FOLDS * 2:
+        print(f"  Pas assez de données ({len(df)} lignes). Abandon.")
+        return
+
+    print(f"  Features : {FEATURES}")
+    print(f"  Méthode  : KFold k={N_FOLDS}, GridSearchCV (cv=3, scoring=r²)")
 
     print("\n" + "=" * 65)
-    print("  DATASET CORRIGÉ  (features NaN imputées par la moyenne)")
+    print("  ENTRAÎNEMENT & ÉVALUATION")
     print("=" * 65)
-    res_b = await evaluer(df_corrige, "Corrigé", pipeline_imputer=False)
+    resultats = await evaluer(df, "ML-ready")
 
     proche_col = f"Proche≤{SEUIL_PROCHE_S}s (%)"
-    # resultats = pd.concat([res_a, res_b], ...)  # réactiver quand expérience A relancée
-    resultats  = res_b.copy()
-    resultats  = resultats[["Dataset", "Modèle", "MAE (s)", "RMSE (s)", "R²",
-                             "MAPE (%)", proche_col, "Meilleurs params"]]
+    cols_affichage = [
+        "Dataset", "Modèle",
+        "MAE (s)", "MAE (s) ±",
+        "RMSE (s)", "RMSE (s) ±",
+        "R²", "R² ±",
+        "MAPE (%)", "MAPE (%) ±",
+        proche_col, proche_col + " ±",
+        "Meilleurs params",
+    ]
+    resultats = resultats[[c for c in cols_affichage if c in resultats.columns]]
 
-    # ── Affichage par métrique ────────────────────────────────
+    # ── Classements par métrique (triés sur la moyenne) ──────────
     metriques_tri = [
         ("R²",         True,  "R² (plus élevé = mieux)"),
-        ("MAE (s)",    False, "MAE — erreur moyenne absolue (plus bas = mieux)"),
+        ("MAE (s)",    False, "MAE — erreur moyenne absolue en secondes (plus bas = mieux)"),
         ("RMSE (s)",   False, "RMSE — pénalise les grandes erreurs (plus bas = mieux)"),
         (proche_col,   True,  f"Proche≤{SEUIL_PROCHE_S}s — % prédictions proches (plus élevé = mieux)"),
     ]
     for col, desc_asc, titre in metriques_tri:
+        std_col = col + " ±"
         tri = resultats.sort_values(col, ascending=not desc_asc).reset_index(drop=True)
         tri.insert(0, "Rang", range(1, len(tri) + 1))
+        # Colonne affichée : "moy ± std"
+        tri[f"{col} (moy ± std)"] = tri.apply(
+            lambda r: f"{r[col]:.3f} ± {r[std_col]:.3f}" if std_col in tri.columns else f"{r[col]:.3f}",
+            axis=1,
+        )
         print(f"\n{'=' * 70}")
         print(f"  {titre}")
         print("=" * 70)
-        print(tri[["Rang", "Dataset", "Modèle", col]].to_string(index=False))
+        print(tri[["Rang", "Modèle", f"{col} (moy ± std)"]].to_string(index=False))
 
     from datetime import datetime
     from rapport import ecrire_rapport  # type: ignore
 
-    dossier = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                           "resultats_modeles")
+    dossier    = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                              "resultats_modeles")
     os.makedirs(dossier, exist_ok=True)
     horodatage = datetime.now().strftime("%Y%m%d_%H%M%S")
 
@@ -443,14 +442,14 @@ async def main():
     print(f"\nRésultats CSV    → {out_csv}")
 
     out_md = ecrire_rapport(
-        resultats   = resultats,
-        dossier     = dossier,
-        horodatage  = horodatage,
-        csv_source  = args.csv,
-        n_lignes    = len(df_corrige),
-        features    = FEATURES,
-        test_size   = TEST_SIZE,
-        seuil_proche= SEUIL_PROCHE_S,
+        resultats    = resultats,
+        dossier      = dossier,
+        horodatage   = horodatage,
+        csv_source   = args.csv,
+        n_lignes     = len(df),
+        features     = FEATURES,
+        n_folds      = N_FOLDS,
+        seuil_proche = SEUIL_PROCHE_S,
     )
     print(f"Rapport Markdown → {out_md}")
 
