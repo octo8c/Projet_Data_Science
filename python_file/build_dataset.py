@@ -3,18 +3,22 @@ PRIM IDFM — Construction du dataset pour la prédiction des retards.
 API : GET /estimated-timetable (SIRI Lite)
 
 Structure :
-  1. Collecte API        → CSV brut (19 cols, passages_tglobal.csv)
+  1. Collecte API        → CSV brut  (passages_tglobal.csv) — sans transformation
   2. Feature engineering → calcul retard_sec, météo, jours fériés, occupation…
   3. Imputation          → NaN comblés (météo, occupation, terminus_encoded)
-  4. Encodage & ML-ready → catégorielles → entiers fixes, CSV final utilisable directement
+  4. Encodage & ML-ready → catégorielles → entiers fixes (dataset_ml.csv) — avec transformation
+
+Le script produit toujours 2 fichiers distincts :
+  • Fichier 1 — sans transformation : dataset_predictions/passages_tglobal.csv
+  • Fichier 2 — avec transformation : dataset_predictions/dataset_ml.csv
 
 CLI :
   python build_dataset.py --collecter [--duree 2.0]
-      Lance la collecte API continue → CSV brut
-  python build_dataset.py --preparer [--csv PATH] [--output PATH]
-      CSV brut (ancien ou nouveau schéma) → CSV ML-ready encodé
-  python build_dataset.py --snapshot [--output PATH]
-      Appel API unique → CSV brut + CSV ML-ready (sans collecte continue)
+      Collecte API continue → fichier 1 (CSV brut, append)
+
+  python build_dataset.py --construire [--csv PATH]
+      → Sans --csv : appelle l'API → écrit fichier 1 + fichier 2
+      → Avec --csv  : lit le CSV fourni (fichier 1) → écrit fichier 2
 """
 
 import csv
@@ -37,10 +41,11 @@ API_KEYS = [
 ]
 _current_key_idx = 0
 
-BASE_URL         = "https://prim.iledefrance-mobilites.fr/marketplace"
-CSV_FILE         = "dataset_predictions/passages_tglobal.csv"
-CSV_FILE_ML      = "dataset_predictions/dataset_ml.csv"
-INTERVALLE_CYCLE = 120  # secondes entre deux cycles
+BASE_URL              = "https://prim.iledefrance-mobilites.fr/marketplace"
+CSV_FILE              = "dataset_predictions/passages_tglobal.csv"
+CSV_FILE_ML           = "dataset_predictions/dataset_ml.csv"
+STOP_POINTS_CACHE     = "dataset_other/stop_points.csv"
+INTERVALLE_CYCLE      = 120  # secondes entre deux cycles
 
 logging.basicConfig(
     level=logging.INFO,
@@ -89,7 +94,7 @@ LIGNES_PAR_REF = {ref: nom for nom, ref in LIGNES.items()}
 # ─────────────────────────────────────────────
 
 CSV_COLONNES = [
-    "line_ref", "operateur", "direction_ref", "terminus",
+    "line_ref", "nom_ligne", "operateur", "direction_ref", "terminus",
     "stop_ref", "nom_arret",
     "horaire_arrivee_prevu", "horaire_depart_prevu",
     "horaire_arrivee_estime", "horaire_depart_estime",
@@ -194,6 +199,7 @@ def _parse_journey(
 
         rows.append({
             "line_ref":               line_ref,
+            "nom_ligne":              LIGNES_PAR_REF.get(line_ref, ""),
             "operateur":              operateur,
             "direction_ref":          direction,
             "terminus":               terminus,
@@ -370,14 +376,14 @@ def _fetch_alertes_prim() -> "dict[str, dict]":
         return {}
 
 
-def collecter_en_continu(duree_heures: float | None = None):
+def collecter_en_continu(duree_heures: float | None = None,csv_file = CSV_FILE):
     debut  = datetime.now()
     cycle  = 0
     limite = duree_heures * 3600 if duree_heures else None
 
     log.info("=" * 55)
     log.info(f"  Collecte continue — {len(LIGNES)} lignes configurées")
-    log.info(f"  Fichier CSV : {os.path.abspath(CSV_FILE)}")
+    log.info(f"  Fichier CSV : {os.path.abspath(csv_file)}")
     log.info(f"  Intervalle  : {INTERVALLE_CYCLE}s  |  Ctrl+C pour arrêter")
     log.info("=" * 55)
 
@@ -387,7 +393,7 @@ def collecter_en_continu(duree_heures: float | None = None):
             log.info(f"\n[Cycle {cycle}] {datetime.now().strftime('%H:%M:%S')}")
             try:
                 rows = get_estimated_timetable()
-                ecrire_csv(rows)
+                ecrire_csv(rows,csv_file)
                 log.info(f"  {len(rows)} lignes écrites")
             except requests.HTTPError as e:
                 log.error(f"  HTTP {e.response.status_code} — {e.response.text[:120]}")
@@ -402,7 +408,7 @@ def collecter_en_continu(duree_heures: float | None = None):
 
     except KeyboardInterrupt:
         log.info(f"\nArrêt manuel après {cycle} cycle(s).")
-        log.info(f"CSV disponible : {os.path.abspath(CSV_FILE)}")
+        log.info(f"CSV disponible : {os.path.abspath(csv_file)}")
 
 
 # ══════════════════════════════════════════════════════════════
@@ -550,6 +556,67 @@ def _target_encode_terminus(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def _target_encode_station(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Encode stop_ref par le retard moyen observé à cet arrêt (target encoding).
+    Capture l'effet propre à chaque station indépendamment de la ligne.
+    Les arrêts sans retard observé reçoivent le retard moyen global.
+    """
+    global_mean = df["retard_sec"].mean(skipna=True)
+    if pd.isna(global_mean):
+        global_mean = 0.0
+    stop_clean = df["stop_ref"].fillna("_inconnu").astype(str).str.strip()
+    stop_clean = stop_clean.where(stop_clean != "", other="_inconnu")
+    means = df.groupby(stop_clean)["retard_sec"].mean()
+    df["station_encoded"] = stop_clean.map(means).fillna(global_mean)
+    return df
+
+
+def _charger_referentiel_arrets() -> "dict[str, str]":
+    """
+    Retourne un dict {id_numerique: nom_arret} pour tous les arrêts IDFM.
+
+    Source : GET /v2/navitia/stop_points (36 000+ arrêts, paginé par 1 000)
+    Cache  : STOP_POINTS_CACHE (dataset_other/stop_points.csv)
+             Régénéré uniquement si le fichier est absent.
+
+    Mapping : "STIF:StopPoint:BP:5886:" → extrait "5886" → clé du dict → "Pissaloup"
+              "STIF:StopPoint:Q:22083:" → extrait "22083" → "Gare de Lyon"
+    """
+    global _current_key_idx
+
+    if os.path.exists(STOP_POINTS_CACHE):
+        df_cache = pd.read_csv(STOP_POINTS_CACHE, dtype={"id": str, "nom": str})
+        return dict(zip(df_cache["id"], df_cache["nom"]))
+
+    log.info("  Référentiel arrêts absent — chargement depuis l'API PRIM…")
+    url     = f"{BASE_URL}/v2/navitia/stop_points"
+    headers = {"apiKey": API_KEYS[_current_key_idx], "accept": "application/json"}
+    stop_dict: dict[str, str] = {}
+    page = 0
+
+    while True:
+        resp = requests.get(url, headers=headers,
+                            params={"count": 1000, "start_page": page}, timeout=30)
+        resp.raise_for_status()
+        data  = resp.json()
+        stops = data.get("stop_points", [])
+        for sp in stops:
+            num_id = sp["id"].split(":")[-1]   # "stop_point:IDFM:5886" → "5886"
+            stop_dict[num_id] = sp["name"]
+        if len(stops) < 1000:
+            break
+        page += 1
+        log.info(f"  Page {page} — {len(stop_dict):,} arrêts chargés…")
+
+    os.makedirs(os.path.dirname(STOP_POINTS_CACHE), exist_ok=True)
+    pd.DataFrame(list(stop_dict.items()), columns=["id", "nom"]).to_csv(
+        STOP_POINTS_CACHE, index=False, encoding="utf-8-sig"
+    )
+    log.info(f"  {len(stop_dict):,} arrêts mis en cache → {STOP_POINTS_CACHE}")
+    return stop_dict
+
+
 def build_features(csv_path: str = CSV_FILE) -> pd.DataFrame:
     """
     Charge un CSV brut (schéma ancien ou courant) et calcule toutes les features.
@@ -558,26 +625,17 @@ def build_features(csv_path: str = CSV_FILE) -> pd.DataFrame:
     with open(csv_path, "r", encoding="utf-8-sig", errors="replace") as _f:
         _file_header = next(csv.reader(_f))
 
-    if _file_header == CSV_COLONNES:
-        df = pd.read_csv(csv_path, low_memory=False)
-    else:
-        log.warning(
-            f"Header CSV ({len(_file_header)} cols) ≠ schéma courant ({len(CSV_COLONNES)} cols) — "
-            "lecture multi-schéma : seules les lignes du schéma courant sont conservées."
+    if _file_header != CSV_COLONNES:
+        raise ValueError(
+            f"Schéma CSV incompatible !\n"
+            f"  Header fichier ({len(_file_header)} cols) ≠ schéma courant ({len(CSV_COLONNES)} cols).\n"
+            f"  Fichier : {os.path.abspath(csv_path)}\n"
+            f"  Action  : supprimer ou remplacer le fichier, puis relancer la collecte."
         )
-        df = pd.read_csv(csv_path, names=CSV_COLONNES, header=0, low_memory=False)
-        mask = (
-            df["line_ref"].astype(str).str.startswith("STIF:") &
-            df["date_capture"].notna()
-        )
-        n_total = len(df)
-        df = df[mask].reset_index(drop=True)
-        log.info(f"  {len(df):,} lignes schéma courant / {n_total:,} total")
 
-    # 1. Nom de la ligne
-    df["nom_ligne"] = df["line_ref"].map(LIGNES_PAR_REF)
+    df = pd.read_csv(csv_path, low_memory=False)
 
-    # 2. Retard arrivée en secondes
+    # 1. Retard arrivée en secondes
     arr_est  = pd.to_datetime(df["horaire_arrivee_estime"], utc=True, errors="coerce")
     arr_prev = pd.to_datetime(df["horaire_arrivee_prevu"],  utc=True, errors="coerce")
     df["retard_sec"] = (arr_est - arr_prev).dt.total_seconds().round().astype("Int64")
@@ -603,14 +661,23 @@ def build_features(csv_path: str = CSV_FILE) -> pd.DataFrame:
     df["temperature"]   = [meteo_map.get((d, h), {}).get("temperature")   for d, h in zip(df["_date_str"], df["_heure_int"])]
     df["meteo_groupe"]  = df["weathercode"].apply(_wmo_groupe)
 
-    # 6. Direction numérique (1 = aller, 2 = retour)
-    df["direction_ref"] = pd.to_numeric(df["direction_ref"], errors="coerce").fillna(0).astype(int)
+    # 6. Direction numérique (1 = aller, 2 = retour, 0 = inconnu)
+    #    L'API PRIM renvoie du texte ("Aller"/"Retour"/"outbound"/"inbound"/"A"/"R")
+    #    → mapping explicite vers des entiers avant la conversion numérique.
+    _DIR_MAP = {
+        "Aller": 1, "aller": 1, "outbound": 1, "OUTBOUND": 1, "A": 1, "1": 1,
+        "Retour": 2, "retour": 2, "inbound": 2,  "INBOUND": 2, "R": 2, "2": 2,
+    }
+    df["direction_ref"] = (
+        df["direction_ref"].astype(str).str.strip().map(_DIR_MAP).fillna(0).astype(int)
+    )
 
     # 7. heure_tranche numérique (peut être string vide dans anciens CSV)
     df["heure_tranche"] = pd.to_numeric(df["heure_tranche"], errors="coerce").fillna(0).astype(int)
 
-    # 8. Target encoding du terminus
+    # 8. Target encoding du terminus et de la station (arrêt)
     df = _target_encode_terminus(df)
+    df = _target_encode_station(df)
 
     # 9. Alertes réseau
     if "alerte_active" not in df.columns:
@@ -620,7 +687,20 @@ def build_features(csv_path: str = CSV_FILE) -> pd.DataFrame:
         df["alerte_active"]    = df["alerte_active"].fillna(False)
         df["categorie_alerte"] = df["categorie_alerte"].fillna("aucune")
 
-    # 10. Occupation horaire (entrées/heure, jointure datasets IDFM)
+    # 10. Résolution du nom de l'arrêt via le référentiel PRIM (API / cache)
+    #     Extrait l'ID numérique de stop_ref (gère :BP: et :Q:)
+    #     puis effectue le lookup dans le référentiel PRIM complet (36 000+ arrêts).
+    df["_ArRId"] = df["stop_ref"].astype(str).str.extract(r":(?:Q|BP):(\d+):").astype("Int64")
+    ref_arrets   = _charger_referentiel_arrets()
+    df["nom_arret"] = (
+        df["_ArRId"].astype(str)
+        .map(ref_arrets)
+        .fillna(df["nom_arret"].replace("", pd.NA))   # fallback sur la valeur déjà présente
+    )
+    taux_rempli = df["nom_arret"].notna().mean()
+    log.info(f"  nom_arret rempli : {taux_rempli:.1%} des lignes")
+
+    # 11. Occupation horaire (entrées/heure, jointure datasets IDFM)
     df_occ = pd.read_csv(
         "dataset_other/occupation_horaire.csv", sep=";", low_memory=False,
         usecols=["LIBELLE_ARRET", "CAT_JOUR", "HEURE", "NB_ENTREES_HEURE"],
@@ -633,7 +713,6 @@ def build_features(csv_path: str = CSV_FILE) -> pd.DataFrame:
     df_ar["_ArRId"] = df_ar["ArRId"].astype("Int64")
     df_ar["_nom"]   = df_ar["ArRName"].str.upper().str.strip()
 
-    df["_ArRId"]    = df["stop_ref"].astype(str).str.extract(r":(?:Q|BP):(\d+):").astype("Int64")
     df["_cat_jour"] = [
         _cat_jour(d, datetime.strptime(d, "%Y-%m-%d").weekday() if isinstance(d, str) and len(d) == 10 else 0)
         for d in df["_date_str"]
@@ -671,7 +750,7 @@ def impute_missing(df: pd.DataFrame) -> pd.DataFrame:
     df["meteo_groupe"]     = df["meteo_groupe"].fillna("inconnu")
     df["categorie_alerte"] = df["categorie_alerte"].fillna("aucune")
 
-    for col in ["precipitation", "snowfall", "wind_speed", "temperature", "terminus_encoded"]:
+    for col in ["precipitation", "snowfall", "wind_speed", "temperature", "terminus_encoded", "station_encoded"]:
         if col in df.columns and df[col].isna().any():
             df[col] = df[col].fillna(df[col].mean())
 
@@ -716,7 +795,7 @@ ML_COLONNES = [
     # Target
     "retard_sec",
     # Numériques
-    "direction_ref", "terminus_encoded", "heure_tranche", "mois",
+    "direction_ref", "terminus_encoded", "station_encoded", "heure_tranche", "mois",
     "jour_ferie", "precipitation", "snowfall", "wind_speed", "temperature", "occupation",
     # Catégorielles encodées (int)
     "nom_ligne", "jour_semaine", "periode_journee", "meteo_groupe", "categorie_alerte",
@@ -805,20 +884,14 @@ def preparer_ml(
     return df
 
 
-def collecter_snapshot_ml(
-    output_brut: str | None = None,
-    output_ml:   str | None = CSV_FILE_ML,
-) -> pd.DataFrame:
+def collecter_snapshot_ml() -> pd.DataFrame:
     """
-    Appel API unique → CSV brut + DataFrame ML-ready.
+    Appel API unique → produit les 2 fichiers du projet :
+      Fichier 1 (sans transformation) → CSV_FILE  (passages_tglobal.csv)
+      Fichier 2 (avec transformation) → CSV_FILE_ML (dataset_ml.csv)
 
-    1. Appelle GET /estimated-timetable (toutes les lignes IDF)
-    2. Écrit le CSV brut dans output_brut (si fourni)
-    3. Applique le pipeline complet (build_features → impute → encode)
-    4. Sauvegarde le CSV ML-ready dans output_ml (si fourni)
-    5. Retourne le DataFrame ML-ready
-
-    Utilisé par prediction.py pour l'inférence temps réel sans fichier intermédiaire.
+    Retourne le DataFrame ML-ready (fichier 2).
+    Utilisé par prediction.py pour l'inférence temps réel.
     """
     log.info(f"  Collecte snapshot API PRIM — {BASE_URL}/estimated-timetable")
     rows = get_estimated_timetable()
@@ -826,12 +899,11 @@ def collecter_snapshot_ml(
         raise ValueError("L'API PRIM n'a retourné aucune donnée.")
     log.info(f"  {len(rows):,} passages récupérés")
 
-    # Écriture CSV brut si demandé
-    if output_brut:
-        ecrire_csv(rows, output_brut)
-        log.info(f"  CSV brut sauvegardé → {output_brut}")
+    # Fichier 1 — sans transformation
+    ecrire_csv(rows, CSV_FILE)
+    log.info(f"  Fichier 1 (sans transformation) → {os.path.abspath(CSV_FILE)}")
 
-    # Pipeline complet via fichier temporaire
+    # Fichier 2 — avec transformation (via fichier temporaire pour éviter de relire CSV_FILE)
     with tempfile.NamedTemporaryFile(
         mode="w", suffix=".csv", delete=False, encoding="utf-8-sig", newline=""
     ) as _f:
@@ -842,10 +914,11 @@ def collecter_snapshot_ml(
         writer.writerows(rows)
 
     try:
-        df = preparer_ml(_tmp, output_path=output_ml)
+        df = preparer_ml(_tmp, output_path=CSV_FILE_ML)
     finally:
         os.unlink(_tmp)
 
+    log.info(f"  Fichier 2 (avec transformation)  → {os.path.abspath(CSV_FILE_ML)}")
     return df
 
 
@@ -855,65 +928,70 @@ def collecter_snapshot_ml(
 
 def main():
     """
-    Modes d'utilisation :
+    Deux modes, deux fichiers produits :
 
       --collecter [--duree H]
-          Collecte API continue → CSV brut (passages_tglobal.csv)
-          Utilisé pour accumuler un historique de passages.
+          Collecte API continue (append) → fichier 1 (sans transformation)
+          Fichier : dataset_predictions/passages_tglobal.csv
 
-      --preparer [--csv PATH] [--output PATH]
-          CSV brut (ancien ou nouveau schéma) → CSV ML-ready encodé
-          Gère la migration des anciens CSV automatiquement.
-          Défaut entrée  : dataset_predictions/passages_tglobal.csv
-          Défaut sortie  : dataset_predictions/dataset_ml.csv
-
-      --snapshot [--output PATH]
-          Appel API unique → prépare directement le CSV ML-ready
-          (sans collecte continue, pratique pour tester)
-          Défaut sortie  : dataset_predictions/dataset_ml.csv
-
-      --collecter --preparer [--duree H]
-          Collecte continue + préparation à la fin de la collecte
+      --construire [--csv PATH]
+          Produit toujours les 2 fichiers :
+            Fichier 1 (sans transformation) → dataset_predictions/passages_tglobal.csv
+            Fichier 2 (avec transformation) → dataset_predictions/dataset_ml.csv
+          Sans --csv : appelle l'API pour générer le fichier 1, puis le transforme.
+          Avec --csv : lit le CSV fourni comme fichier 1 et génère le fichier 2.
     """
     import argparse
     parser = argparse.ArgumentParser(description="Construction du dataset PRIM IDFM")
-    parser.add_argument("--collecter", action="store_true",
-                        help="Collecte API continue → CSV brut")
-    parser.add_argument("--preparer",  action="store_true",
-                        help="CSV brut → CSV ML-ready (feature engineering + encodage)")
-    parser.add_argument("--corriger",  action="store_true",
-                        help="Alias de --preparer (compatibilité)")
-    parser.add_argument("--snapshot",  action="store_true",
-                        help="API → CSV ML-ready en une seule commande")
-    parser.add_argument("--csv",    default=CSV_FILE,    metavar="PATH",
-                        help="CSV source  (défaut : %(default)s)")
-    parser.add_argument("--output", default=CSV_FILE_ML, metavar="PATH",
-                        help="CSV de sortie (défaut : %(default)s)")
-    parser.add_argument("--duree",  type=float, default=None, metavar="HEURES",
-                        help="Durée de collecte en heures (défaut : infinie)")
+    parser.add_argument("--collecter",  action="store_true",
+                        help="Collecte API continue → fichier 1 (CSV brut, sans transformation)")
+    parser.add_argument("--construire", action="store_true",
+                        help="Produit les 2 fichiers : brut + ML-ready. "
+                             "Sans --csv : appelle l'API d'abord.")
+    parser.add_argument("--csv",   default=None, metavar="PATH",
+                        help="CSV brut source pour --construire (défaut : appel API)")
+    parser.add_argument("--duree", type=float, default=None, metavar="HEURES",
+                        help="Durée de collecte en heures pour --collecter (défaut : infinie)")
     args = parser.parse_args()
 
-    if not any([args.collecter, args.preparer, args.corriger, args.snapshot]):
+    if not args.collecter and not args.construire:
         parser.print_help()
         return
 
     if args.collecter:
+        csv_collecte = CSV_FILE
+        if args.csv:
+            csv_collecte = os.path.abspath(args.csv)
         msg = (f"Démarrage collecte — durée : {args.duree}h"
                if args.duree else "Démarrage collecte — durée : infinie (Ctrl+C pour arrêter)")
         log.info(msg)
-        collecter_en_continu(duree_heures=args.duree)
+        collecter_en_continu(duree_heures=args.duree,csv_file = csv_collecte)
 
-    if args.preparer or args.corriger:
-        log.info(f"Préparation dataset ML depuis : {args.csv}")
-        df = preparer_ml(args.csv, output_path=args.output)
-        nan_cible = int(df["retard_sec"].isna().sum())
-        log.info(f"  NaN résiduels (retard_sec) : {nan_cible:,} / {len(df):,}")
-        log.info(f"  Colonnes : {list(df.columns)}")
+    if args.construire:
+        log.info("=" * 55)
+        log.info("  CONSTRUCTION DES 2 FICHIERS")
+        log.info("=" * 55)
 
-    if args.snapshot:
-        log.info("Snapshot API → dataset ML-ready")
-        df = collecter_snapshot_ml(output_ml=args.output)
-        log.info(f"  {len(df):,} lignes prêtes pour la prédiction")
+        if args.csv:
+            # Fichier 1 fourni → on génère uniquement le fichier 2
+            csv_brut = args.csv
+            CSV_DISPONIBLE = csv_brut
+            log.info(f"  Fichier 1 (sans transformation) → {os.path.abspath(csv_brut)}")
+            df_ml = preparer_ml(csv_brut, output_path=CSV_FILE_ML)
+            log.info(f"  Fichier 2 (avec transformation)  → {os.path.abspath(CSV_FILE_ML)}")
+        else:
+            # Pas de CSV → appel API → fichier 1 + fichier 2
+            log.info("  Appel API PRIM — collecte des passages…")
+            rows = get_estimated_timetable()
+            if not rows:
+                log.error("  Aucune donnée retournée par l'API.")
+                return
+            ecrire_csv(rows, CSV_FILE)
+            log.info(f"  Fichier 1 (sans transformation) → {os.path.abspath(CSV_FILE)}")
+            df_ml = preparer_ml(CSV_FILE, output_path=CSV_FILE_ML)
+            log.info(f"  Fichier 2 (avec transformation)  → {os.path.abspath(CSV_FILE_ML)}")
+
+        log.info(f"  {len(df_ml):,} lignes × {len(df_ml.columns)} colonnes dans le fichier 2")
 
 
 if __name__ == "__main__":

@@ -1,0 +1,35 @@
+{
+  "Ridge": {
+    "alpha": 100.0
+  },
+  "DecisionTree": {
+    "max_depth": 12,
+    "min_samples_leaf": 5,
+    "min_samples_split": 2
+  },
+  "KNeighbors": {
+    "n_neighbors": 10,
+    "weights": "distance"
+  },
+  "ExtraTrees": {
+    "max_depth": 10,
+    "min_samples_leaf": 5,
+    "n_estimators": 200
+  },
+  "RandomForest": {
+    "max_depth": 20,
+    "min_samples_leaf": 20,
+    "n_estimators": 100
+  },
+  "HistGradientBoosting": {
+    "l2_regularization": 0.0,
+    "learning_rate": 0.2,
+    "max_iter": 200,
+    "max_leaf_nodes": 31
+  },
+  "GradientBoosting": {
+    "learning_rate": 0.2,
+    "max_depth": 3,
+    "n_estimators": 100
+  }
+}
