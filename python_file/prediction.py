@@ -67,24 +67,24 @@ _CACHE_CLASSIFICATION = os.path.join(_DOSSIER, "best_params_classification.json"
 
 # ── Modèles ──────────────────────────────────
 MODELES_REGRESSION = {
-    "LinearRegression":     LinearRegression(n_jobs=-1),
+    "LinearRegression":     LinearRegression(),
     "Ridge":                Ridge(),
     "DecisionTree":         DecisionTreeRegressor(random_state=RANDOM_STATE),
-    "RandomForest":         RandomForestRegressor(random_state=RANDOM_STATE, n_jobs=-1),
-    "ExtraTrees":           ExtraTreesRegressor(random_state=RANDOM_STATE, n_jobs=-1),
+    "RandomForest":         RandomForestRegressor(random_state=RANDOM_STATE, n_jobs=1),
+    "ExtraTrees":           ExtraTreesRegressor(random_state=RANDOM_STATE, n_jobs=1),
     "GradientBoosting":     GradientBoostingRegressor(random_state=RANDOM_STATE),
     "HistGradientBoosting": HistGradientBoostingRegressor(random_state=RANDOM_STATE),
-    "KNeighbors":           KNeighborsRegressor(n_jobs=-1),
+    "KNeighbors":           KNeighborsRegressor(n_jobs=1),
 }
 
 MODELES_CLASSIFICATION = {
     "LogisticRegression":   LogisticRegression(max_iter=1000),
     "SVC":                  SVC(probability=True, random_state=RANDOM_STATE),
     "DecisionTree":         DecisionTreeClassifier(random_state=RANDOM_STATE),
-    "RandomForest":         RandomForestClassifier(random_state=RANDOM_STATE, n_jobs=-1),
+    "RandomForest":         RandomForestClassifier(random_state=RANDOM_STATE, n_jobs=1),
     "GradientBoosting":     GradientBoostingClassifier(random_state=RANDOM_STATE),
     "HistGradientBoosting": HistGradientBoostingClassifier(random_state=RANDOM_STATE),
-    "KNeighbors":           KNeighborsClassifier(n_jobs=-1),
+    "KNeighbors":           KNeighborsClassifier(n_jobs=1),
 }
 
 # ── Grilles de paramètres ─────────────────────
@@ -480,6 +480,15 @@ async def evaluer_classification(df: pd.DataFrame, label: str) -> tuple[pd.DataF
     cache = _lire_cache(_CACHE_CLASSIFICATION)
     loop  = asyncio.get_event_loop()
 
+    SVC_MAX_SAMPLES = 10_000
+    if len(X) > SVC_MAX_SAMPLES:
+        rng = np.random.default_rng(42)
+        svc_idx = rng.choice(len(X), size=SVC_MAX_SAMPLES, replace=False)
+        X_svc, y_svc = X[svc_idx], y[svc_idx]
+        print(f"  SVC limité à {SVC_MAX_SAMPLES:,} lignes tirées au hasard (dataset trop grand)")
+    else:
+        X_svc, y_svc = X, y
+
     executor = ProcessPoolExecutor()
     futures = {
         loop.run_in_executor(
@@ -488,7 +497,9 @@ async def evaluer_classification(df: pd.DataFrame, label: str) -> tuple[pd.DataF
             nom, modele,
             PARAM_GRIDS_CLASSIFICATION.get(nom, {}),
             cache.get(nom),
-            X, y, N_FOLDS,
+            X_svc if nom == "SVC" else X,
+            y_svc if nom == "SVC" else y,
+            N_FOLDS,
         ): nom
         for nom, modele in MODELES_CLASSIFICATION.items()
     }

@@ -71,7 +71,8 @@ def _fmt(row, col: str) -> str:
 def _entete(titre: str, horodatage: str, csv_source: str, n_lignes: int,
             n_folds: int, cv_methode: str, scoring: str) -> list[str]:
     date_fmt  = horodatage[:8]
-    heure_fmt = horodatage[9:].replace("-", ":")
+    h         = horodatage[9:]
+    heure_fmt = f"{h[:2]}:{h[2:4]}:{h[4:]}"
     return [
         f"# {titre}\n",
         f"**Date :** {date_fmt[:4]}-{date_fmt[4:6]}-{date_fmt[6:]}  ",
@@ -127,9 +128,9 @@ def ecrire_rapport_regression(
         lignes.append(f"### {titre} ({sens})\n")
         lignes.append("| Rang | Modèle | Dataset | Valeur (moy ± std) | Meilleurs params |")
         lignes.append("|:----:|--------|---------|-------------------:|------------------|")
-        for rang, row in tri.iterrows():
+        for rang, (_, row) in enumerate(tri.iterrows(), start=1):
             lignes.append(
-                f"| {rang + 1} | {row['Modèle']} | {row['Dataset']} "
+                f"| {rang} | {row['Modèle']} | {row['Dataset']} "
                 f"| {_fmt(row, col)} | `{row['Meilleurs params']}` |"
             )
         lignes.append("")
@@ -228,9 +229,9 @@ def ecrire_rapport_classification(
         lignes.append(f"### {titre} ({sens})\n")
         lignes.append("| Rang | Modèle | Valeur (moy ± std) | Meilleurs params |")
         lignes.append("|:----:|--------|-------------------:|------------------|")
-        for rang, row in tri.iterrows():
+        for rang, (_, row) in enumerate(tri.iterrows(), start=1):
             lignes.append(
-                f"| {rang + 1} | {row['Modèle']} "
+                f"| {rang} | {row['Modèle']} "
                 f"| {_fmt(row, col)} | `{row['Meilleurs params']}` |"
             )
         lignes.append("")

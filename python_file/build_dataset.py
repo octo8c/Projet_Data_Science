@@ -101,6 +101,7 @@ CSV_COLONNES = [
     "arrivee_prevue_hhmm", "depart_prevu_hhmm", "depart_estime_hhmm",
     "jour_semaine", "heure_tranche", "periode_journee",
     "alerte_active", "categorie_alerte", "date_capture",
+    "retard_sec",
 ]
 
 
@@ -145,6 +146,18 @@ def _periode(h: int) -> str:
     if h < 16:  return "Creuse après-midi"
     if h < 20:  return "Pointe soir"
     return "Soirée"
+
+
+def _calc_retard_sec(prevu: str, estime: str) -> int | None:
+    """Retourne (estime - prevu) en secondes entiers, ou None si l'un des deux est absent."""
+    if not prevu or not estime:
+        return None
+    try:
+        t_prev = datetime.fromisoformat(prevu.replace("Z", "+00:00"))
+        t_est  = datetime.fromisoformat(estime.replace("Z", "+00:00"))
+        return int(round((t_est - t_prev).total_seconds()))
+    except Exception:
+        return None
 
 
 def _enrichissement_temporel(heure_ref: str) -> tuple:
@@ -218,6 +231,7 @@ def _parse_journey(
             "alerte_active":          alerte_active,
             "categorie_alerte":       categorie_alerte,
             "date_capture":           now_capture,
+            "retard_sec":             _calc_retard_sec(aimed_arr, exp_arr),
         })
     return rows
 
