@@ -45,7 +45,7 @@ warnings.filterwarnings("ignore")
 # ─────────────────────────────────────────────
 
 TARGET       = "retard_sec"
-FEATURES_CAT = ["nom_ligne", "jour_semaine", "periode_journee", "meteo_groupe", "categorie_alerte"]
+FEATURES_CAT = ["nom_ligne", "jour_semaine", "periode_journee", "meteo_groupe", "categorie_alerte","stations"]
 FEATURES_NUM = [
     "heure_tranche", "mois", "jour_ferie", "occupation",
     "direction_ref", "terminus_encoded", "station_encoded",

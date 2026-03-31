@@ -65,11 +65,14 @@ def graphique_lignes(df_stats, prefixe, titre, fichier):
 def heatmap_retard_ligne_heure(df, fichier="heatmap_retard_ligne_heure.png"):
     df_w = df[df["nom_ligne"].notna() & ~df["nom_ligne"].str.startswith("STIF") & (df["nom_ligne"] != "")].copy()
     df_w["retard_sec"] = pd.to_numeric(df_w["retard_sec"], errors="coerce")
+    df_w["heure_tranche"] = pd.to_numeric(df_w["heure_tranche"], errors="coerce").astype("Int64")
+    df_w = df_w.dropna(subset=["heure_tranche"])
     pivot = (
         df_w.groupby(["nom_ligne", "heure_tranche"])["retard_sec"]
         .mean().unstack("heure_tranche").sort_index()
     )
-    pivot = pivot[pivot.notna().sum(axis=1) > 0].reindex(columns=sorted(pivot.columns))
+    pivot = pivot[pivot.notna().sum(axis=1) > 0]
+    pivot = pivot[sorted(pivot.columns)]
     vals = pivot.values
     finite = vals[~np.isnan(vals)]
     vmax = float(np.percentile(finite, 95)) if len(finite) else 1.0
@@ -101,7 +104,7 @@ def heatmap_retard_ligne_heure(df, fichier="heatmap_retard_ligne_heure.png"):
 
 
 def valeurs_manquantes_metro_depart(df, fichier="missing_metro_depart.png"):
-    COLS_DEPART = ["horaire_depart_prevu", "horaire_depart_estime",
+    COLS_DEPART = ["horaire_arrivee_prevu", "horaire_arrivee_estime",
                    "depart_prevu_hhmm", "depart_estime_hhmm", "retard_sec"]
     LABELS = ["Depart prevu (ts)", "Depart estime (ts)",
               "Depart prevu HH:MM", "Depart estime HH:MM", "Retard (s)"]
@@ -291,12 +294,8 @@ def main():
 
 # ── Graphique 5 : Évolution du retard par date ───────────────────────────────
 
-    TOP_LIGNES_DATE = 5
-    top_lignes_date = (
-        stats_lisibles[stats_lisibles['retard_moyen'] > 0]
-        .head(TOP_LIGNES_DATE)['nom_ligne']
-        .tolist()
-    )
+    LIGNES_RER = ['RER A', 'RER B', 'RER C', 'RER D', 'RER E']
+    top_lignes_date = [l for l in LIGNES_RER if l in stats_lisibles['nom_ligne'].values]
 
     stats_date = (
         df_passage[df_passage['nom_ligne'].isin(top_lignes_date)]
@@ -317,7 +316,7 @@ def main():
                 marker='o', markersize=4, label=ligne, color=couleur_map[ligne])
 
     ax.axhline(0, color='black', linewidth=0.8, linestyle='--')
-    ax.set_title(f"Évolution du retard moyen par date — Top {TOP_LIGNES_DATE} lignes les plus en retard")
+    ax.set_title("Évolution du retard moyen par date — Lignes RER")
     ax.set_xlabel("Date")
     ax.set_ylabel("Retard moyen (secondes)")
     plt.xticks(rotation=45, ha='right')

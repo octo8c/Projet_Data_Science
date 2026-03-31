@@ -30,6 +30,8 @@ from datetime import datetime, timezone
 
 import pandas as pd
 import requests
+from sklearn.preprocessing import TargetEncoder
+from sklearn.model_selection import train_test_split
 
 # ─────────────────────────────────────────────
 # CONFIGURATION
@@ -88,6 +90,30 @@ LIGNES = {
 }
 
 LIGNES_PAR_REF = {ref: nom for nom, ref in LIGNES.items()}
+
+# ─────────────────────────────────────────────
+# MAPPING ÉTENDU DEPUIS GTFS (couvre tous les bus, trams, etc.)
+# ─────────────────────────────────────────────
+def _build_gtfs_mapping() -> "dict[str, str]":
+    _prefixe = {"0": "Tram", "1": "Métro", "2": "Ligne", "3": "Bus", "6": "Câble", "7": "Funiculaire"}
+    _gtfs = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "IDFM-gtfs(1)", "routes.txt")
+    if not os.path.exists(_gtfs):
+        return {}
+    _routes = pd.read_csv(_gtfs, dtype=str, usecols=["route_id", "route_short_name", "route_type"])
+    _out: dict[str, str] = {}
+    for _, r in _routes.iterrows():
+        _ref = "STIF:Line::" + str(r["route_id"]).replace("IDFM:", "") + ":"
+        if _ref not in LIGNES_PAR_REF:  # ne pas écraser les noms explicites
+            _p = _prefixe.get(str(r["route_type"]), "Ligne")
+            _n = str(r["route_short_name"]).strip()
+            _out[_ref] = f"{_p} {_n}" if _n else _p
+    return _out
+
+_GTFS_LIGNES = _build_gtfs_mapping()
+
+def resoudre_nom_ligne(line_ref: str) -> str:
+    """Nom lisible d'une ligne : LIGNES_PAR_REF en priorité, puis GTFS."""
+    return LIGNES_PAR_REF.get(line_ref) or _GTFS_LIGNES.get(line_ref, "")
 
 # ─────────────────────────────────────────────
 # COLONNES CSV BRUT (collecte)
@@ -189,6 +215,7 @@ def _parse_journey(
     now_local: datetime,
     now_capture: str,
     alertes_map: "dict[str, dict]",
+    ref_arrets: "dict[str, str] | None" = None,
 ) -> list[dict]:
     """Transforme une EstimatedVehicleJourney en liste de lignes CSV."""
     line_ref    = _val(journey.get("LineRef"))
@@ -200,6 +227,9 @@ def _parse_journey(
     alerte_active    = alerte_info.get("alerte_active", False)
     categorie_alerte = alerte_info.get("categorie_alerte", "aucune")
 
+    # nom_ligne : LIGNES_PAR_REF en priorité, puis GTFS complet
+    nom_ligne = resoudre_nom_ligne(line_ref)
+
     rows = []
     for call, _ in _parse_calls(journey):
         aimed_arr = _val(call.get("AimedArrivalTime"))
@@ -210,14 +240,23 @@ def _parse_journey(
         heure_ref            = aimed_dep or aimed_arr or exp_dep or exp_arr
         h_tranche, h_periode = _enrichissement_temporel(heure_ref)
 
+        # nom_arret : priorité à StopPointName, fallback sur référentiel (même logique que build_features)
+        stop_ref  = _val(call.get("StopPointRef"))
+        nom_arret = _val(call.get("StopPointName"))
+        if not nom_arret and ref_arrets:
+            import re as _re
+            m = _re.search(r":(?:Q|BP):(\d+):", stop_ref)
+            if m:
+                nom_arret = ref_arrets.get(m.group(1), "")
+
         rows.append({
             "line_ref":               line_ref,
-            "nom_ligne":              LIGNES_PAR_REF.get(line_ref, ""),
+            "nom_ligne":              nom_ligne,
             "operateur":              operateur,
             "direction_ref":          direction,
             "terminus":               terminus,
-            "stop_ref":               _val(call.get("StopPointRef")),
-            "nom_arret":              _val(call.get("StopPointName")),
+            "stop_ref":               stop_ref,
+            "nom_arret":              nom_arret,
             "horaire_arrivee_prevu":  aimed_arr,
             "horaire_depart_prevu":   aimed_dep,
             "horaire_arrivee_estime": exp_arr,
@@ -263,6 +302,9 @@ def get_estimated_timetable() -> list[dict]:
     alertes_map = _fetch_alertes_prim()
     log.info(f"  Alertes actives : {len(alertes_map)} ligne(s) concernée(s)")
 
+    ref_arrets = _charger_referentiel_arrets()
+    log.info(f"  Référentiel arrêts chargé : {len(ref_arrets):,} entrées")
+
     try:
         deliveries = data["Siri"]["ServiceDelivery"]["EstimatedTimetableDelivery"]
         if isinstance(deliveries, dict):
@@ -279,7 +321,7 @@ def get_estimated_timetable() -> list[dict]:
                     journeys = [journeys]
 
                 for journey in journeys:
-                    rows.extend(_parse_journey(journey, now_local, now_capture, alertes_map))
+                    rows.extend(_parse_journey(journey, now_local, now_capture, alertes_map, ref_arrets))
 
     except (KeyError, TypeError) as e:
         log.warning(f"Parsing échoué : {e}")
@@ -583,6 +625,27 @@ def _target_encode_station(df: pd.DataFrame) -> pd.DataFrame:
     stop_clean = stop_clean.where(stop_clean != "", other="_inconnu")
     means = df.groupby(stop_clean)["retard_sec"].mean()
     df["station_encoded"] = stop_clean.map(means).fillna(global_mean)
+    
+    TargetEncoder()
+    return df
+
+def target_encode(df:pd.DataFrame,categorical_features:list,target:str) -> pd.DataFrame:
+    """_summary_
+
+    Args:
+        df (pd.DataFrame): _description_
+        categorical_features (list): _description_
+
+    Returns:
+        pd.DataFrame: _description_
+    """
+    te = TargetEncoder(categories='auto',target_type='continuous',cv=5,smooth='auto',random_state=42)
+    y = df[target]
+    X = df[categorical_features]
+    X_train,X_test,y_train,y_test = train_test_split(X,y,train_size=.80)
+    te.fit(X_train,y_train)
+    te.transform(X_train)
+    te.transform(X_test)
     return df
 
 
@@ -648,6 +711,13 @@ def build_features(csv_path: str = CSV_FILE) -> pd.DataFrame:
         )
 
     df = pd.read_csv(csv_path, low_memory=False)
+
+    # 0. nom_ligne : remplir les valeurs vides/absentes via LIGNES_PAR_REF + GTFS
+    if "nom_ligne" not in df.columns:
+        df["nom_ligne"] = df["line_ref"].map(resoudre_nom_ligne)
+    else:
+        mask_vide = df["nom_ligne"].isna() | (df["nom_ligne"].astype(str).str.strip() == "")
+        df.loc[mask_vide, "nom_ligne"] = df.loc[mask_vide, "line_ref"].map(resoudre_nom_ligne)
 
     # 1. Retard arrivée en secondes
     arr_est  = pd.to_datetime(df["horaire_arrivee_estime"], utc=True, errors="coerce")
