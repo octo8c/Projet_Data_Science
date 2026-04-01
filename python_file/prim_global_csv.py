@@ -24,6 +24,8 @@ import time
 import logging
 from datetime import datetime, timezone
 
+from tools import tl
+
 # ─────────────────────────────────────────────
 # CONFIGURATION
 # ─────────────────────────────────────────────
@@ -47,109 +49,8 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────────
-# LIGNES À SURVEILLER
-# Format PRIM obligatoire : "STIF:Line::CXXXXX:"  (double :: et : final)
-# Exemple curl validé :
-#   curl 'https://prim.iledefrance-mobilites.fr/marketplace/estimated-timetable
-#         ?LineRef=STIF%3ALine%3A%3AC01742%3A'
-# ─────────────────────────────────────────────
-
-LIGNES = {
-    # ── Métro ──────────────────────────────
-    "Métro 1":   "STIF:Line::C01371:",
-    "Métro 2":   "STIF:Line::C01372:",
-    "Métro 3":   "STIF:Line::C01373:",
-    "Métro 3b":  "STIF:Line::C01386:",
-    "Métro 4":   "STIF:Line::C01374:",
-    "Métro 5":   "STIF:Line::C01375:",
-    "Métro 6":   "STIF:Line::C01376:",
-    "Métro 7":   "STIF:Line::C01377:",
-    "Métro 7b":  "STIF:Line::C01387:",
-    "Métro 8":   "STIF:Line::C01378:",
-    "Métro 9":   "STIF:Line::C01379:",
-    "Métro 10":  "STIF:Line::C01380:",
-    "Métro 11":  "STIF:Line::C01381:",
-    "Métro 12":  "STIF:Line::C01382:",
-    "Métro 13":  "STIF:Line::C01383:",
-    "Métro 14":  "STIF:Line::C01384:",
-    # ── RER ────────────────────────────────
-    "RER A":     "STIF:Line::C01742:",
-    "RER B":     "STIF:Line::C01743:",
-    "RER C":     "STIF:Line::C01727:",
-    "RER D":     "STIF:Line::C01728:",
-    "RER E":     "STIF:Line::C01729:",
-    # ── Transilien ─────────────────────────
-    "Ligne H":   "STIF:Line::C01737:",
-    "Ligne J":   "STIF:Line::C01738:",
-    "Ligne K":   "STIF:Line::C01739:",
-    "Ligne L":   "STIF:Line::C01740:",
-    "Ligne N":   "STIF:Line::C01741:",
-    "Ligne P":   "STIF:Line::C01744:",
-    "Ligne R":   "STIF:Line::C01745:",
-    "Ligne U":   "STIF:Line::C01746:",
-    # ── Tramway ────────────────────────────
-    "Tram T1":   "STIF:Line::C01389:",
-    "Tram T2":   "STIF:Line::C01390:",
-    "Tram T3a":  "STIF:Line::C01391:",
-    "Tram T3b":  "STIF:Line::C01679:",
-    "Tram T4":   "STIF:Line::C01392:",
-    "Tram T5":   "STIF:Line::C01775:",
-    "Tram T6":   "STIF:Line::C01776:",
-    "Tram T7":   "STIF:Line::C01777:",
-    "Tram T8":   "STIF:Line::C01778:",
-    "Tram T9":   "STIF:Line::C02317:",
-    "Tram T10":  "STIF:Line::C02316:",
-    "Tram T11":  "STIF:Line::C02024:",
-    "Tram T13":  "STIF:Line::C02048:",
-}
-
-# ─────────────────────────────────────────────
-# COLONNES CSV
-# ─────────────────────────────────────────────
-
-CSV_COLONNES = [
-    # — Contexte de collecte —
-    "timestamp_collecte",       # Quand on a fait la requête
-    "timestamp_utc",            # Idem en UTC
-    # — Identification de la course —
-    "nom_ligne",                # Nom lisible (ex: "RER B")
-    "line_ref",                 # ID IDFM de la ligne
-    "operateur",                # RATP / SNCF Transilien…
-    "direction_ref",            # Code direction (Aller / Retour)
-    "terminus",                 # Terminus de la course
-    "vehicle_journey_ref",      # Identifiant unique de la course
-    "date_course",              # Jour de la course (YYYY-MM-DD)
-    # — Arrêt concerné —
-    "ordre_arret",              # Position dans la course (1, 2, 3…)
-    "stop_ref",                 # Identifiant de l'arrêt IDFM
-    "nom_arret",                # Nom de l'arrêt
-    # — Horaires —
-    "horaire_arrivee_prevu",    # AimedArrivalTime (ISO 8601)
-    "horaire_depart_prevu",     # AimedDepartureTime (ISO 8601)
-    "horaire_arrivee_estime",   # ExpectedArrivalTime (temps réel)
-    "horaire_depart_estime",    # ExpectedDepartureTime (temps réel)
-    "arrivee_prevue_hhmm",      # HH:MM lisible
-    "depart_prevu_hhmm",        # HH:MM lisible
-    "depart_estime_hhmm",       # HH:MM lisible
-    # — Retard calculé —
-    "retard_arrivee_sec",       # En secondes (négatif = en avance)
-    "retard_depart_sec",
-    "retard_depart_min",        # En minutes, arrondi à 1 décimale
-    "statut_retard",            # Catégorie textuelle
-    # — Type de passage —
-    "est_enregistre",           # True si RecordedCall (déjà passé)
-    "quai",                     # Numéro de quai si fourni
-    # — Enrichissement temporel —
-    "jour_semaine",             # Lundi…Dimanche
-    "heure_tranche",            # 0–23 (heure entière du départ prévu)
-    "periode_journee",          # Nuit / Pointe matin / Creuse…
-]
-
-# ─────────────────────────────────────────────
 # UTILITAIRES
 # ─────────────────────────────────────────────
-
-JOURS = ["Lundi","Mardi","Mercredi","Jeudi","Vendredi","Samedi","Dimanche"]
 
 def fmt_hhmm(iso: str | None) -> str:
     if not iso:
@@ -375,7 +276,7 @@ def get_estimated_timetable(line_ref: str) -> list[dict]:
                             "statut_retard":          statut,
                             "est_enregistre":         is_recorded,
                             "quai":                   quai,
-                            "jour_semaine":           JOURS[now_local.weekday()],
+                            "jour_semaine":           tl.JOURS[now_local.weekday()],
                             "heure_tranche":          h_tranche,
                             "periode_journee":        h_periode,
                         })
@@ -392,7 +293,7 @@ def get_estimated_timetable(line_ref: str) -> list[dict]:
 def ecrire_csv(rows: list[dict]):
     nouveau = not os.path.exists(CSV_FILE)
     with open(CSV_FILE, "a", newline="", encoding="utf-8-sig") as f:
-        writer = csv.DictWriter(f, fieldnames=CSV_COLONNES, extrasaction="ignore")
+        writer = csv.DictWriter(f, fieldnames=tl.CSV_COLONNES_COLLECTE, extrasaction="ignore")
         if nouveau:
             writer.writeheader()
         writer.writerows(rows)
@@ -404,7 +305,7 @@ def ecrire_csv(rows: list[dict]):
 def collecter_toutes_les_lignes() -> int:
     """Un cycle : interroge toutes les lignes, retourne le nombre de lignes écrites."""
     total = 0
-    for nom, ref in LIGNES.items():
+    for nom, ref in tl.LIGNES.items():
         log.info(f"  → {nom} ({ref})")
         try:
             rows = get_estimated_timetable(ref)
@@ -427,7 +328,7 @@ def collecter_en_continu(duree_heures: float | None = None):
     limite   = duree_heures * 3600 if duree_heures else None
 
     log.info("=" * 55)
-    log.info(f"  Collecte continue — {len(LIGNES)} lignes configurées")
+    log.info(f"  Collecte continue — {len(tl.LIGNES)} lignes configurées")
     log.info(f"  Fichier CSV : {os.path.abspath(CSV_FILE)}")
     log.info(f"  Intervalle  : {INTERVALLE_CYCLE}s  |  Ctrl+C pour arrêter")
     log.info("=" * 55)

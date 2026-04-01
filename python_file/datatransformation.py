@@ -1,4 +1,5 @@
 import pandas as pd
+from tools import LIGNES_PAR_REF
 from datetime import datetime
 
 DIR_PREDICT = 'dataset_predictions/'
@@ -7,32 +8,6 @@ DIR_OTHER = 'dataset_other/'
 # ─────────────────────────────────────────────
 # CHARGEMENT
 # ─────────────────────────────────────────────
-
-# Mapping line_ref → nom_ligne (fallback si prim_global_csv ne l'a pas rempli)
-LIGNES_PAR_REF = {
-    "STIF:Line::C01371:": "Métro 1",   "STIF:Line::C01372:": "Métro 2",
-    "STIF:Line::C01373:": "Métro 3",   "STIF:Line::C01386:": "Métro 3b",
-    "STIF:Line::C01374:": "Métro 4",   "STIF:Line::C01375:": "Métro 5",
-    "STIF:Line::C01376:": "Métro 6",   "STIF:Line::C01377:": "Métro 7",
-    "STIF:Line::C01387:": "Métro 7b",  "STIF:Line::C01378:": "Métro 8",
-    "STIF:Line::C01379:": "Métro 9",   "STIF:Line::C01380:": "Métro 10",
-    "STIF:Line::C01381:": "Métro 11",  "STIF:Line::C01382:": "Métro 12",
-    "STIF:Line::C01383:": "Métro 13",  "STIF:Line::C01384:": "Métro 14",
-    "STIF:Line::C01742:": "RER A",     "STIF:Line::C01743:": "RER B",
-    "STIF:Line::C01727:": "RER C",     "STIF:Line::C01728:": "RER D",
-    "STIF:Line::C01729:": "RER E",
-    "STIF:Line::C01737:": "Ligne H",   "STIF:Line::C01738:": "Ligne J",
-    "STIF:Line::C01739:": "Ligne K",   "STIF:Line::C01740:": "Ligne L",
-    "STIF:Line::C01741:": "Ligne N",   "STIF:Line::C01744:": "Ligne P",
-    "STIF:Line::C01745:": "Ligne R",   "STIF:Line::C01746:": "Ligne U",
-    "STIF:Line::C01389:": "Tram T1",   "STIF:Line::C01390:": "Tram T2",
-    "STIF:Line::C01391:": "Tram T3a",  "STIF:Line::C01679:": "Tram T3b",
-    "STIF:Line::C01392:": "Tram T4",   "STIF:Line::C01775:": "Tram T5",
-    "STIF:Line::C01776:": "Tram T6",   "STIF:Line::C01777:": "Tram T7",
-    "STIF:Line::C01778:": "Tram T8",   "STIF:Line::C02317:": "Tram T9",
-    "STIF:Line::C02316:": "Tram T10",  "STIF:Line::C02024:": "Tram T11",
-    "STIF:Line::C02048:": "Tram T13",
-}
 
 df = pd.read_csv(DIR_PREDICT + 'passages_global.csv', low_memory=False)
 df_arrets = pd.read_csv(DIR_OTHER + 'arrets .csv', sep=';', low_memory=False)

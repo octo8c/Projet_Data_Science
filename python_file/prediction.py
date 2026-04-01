@@ -38,25 +38,14 @@ from sklearn.ensemble import (
 )
 from sklearn.neighbors import KNeighborsRegressor, KNeighborsClassifier
 
+import tools as tl
+
 warnings.filterwarnings("ignore")
 
 # ─────────────────────────────────────────────
 # CONFIGURATION
 # ─────────────────────────────────────────────
 
-TARGET       = "retard_sec"
-FEATURES_CAT = ["nom_ligne", "jour_semaine", "periode_journee", "meteo_groupe", "categorie_alerte","stations"]
-FEATURES_NUM = [
-    "heure_tranche", "mois", "jour_ferie", "occupation",
-    "direction_ref", "terminus_encoded", "station_encoded",
-    "precipitation", "snowfall", "wind_speed", "temperature",
-]
-FEATURES = FEATURES_CAT + FEATURES_NUM
-
-N_FOLDS        = 5
-RANDOM_STATE   = 42
-SEUIL_PROCHE_S = 60   # régression : prédiction "proche" si |erreur| ≤ 60 s
-SEUIL_RETARD   = 300  # classification : retard si > 5 min
 
 _DOSSIER = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
@@ -69,85 +58,22 @@ _CACHE_CLASSIFICATION = os.path.join(_DOSSIER, "best_params_classification.json"
 MODELES_REGRESSION = {
     "LinearRegression":     LinearRegression(),
     "Ridge":                Ridge(),
-    "DecisionTree":         DecisionTreeRegressor(random_state=RANDOM_STATE),
-    "RandomForest":         RandomForestRegressor(random_state=RANDOM_STATE, n_jobs=1),
-    "ExtraTrees":           ExtraTreesRegressor(random_state=RANDOM_STATE, n_jobs=1),
-    "GradientBoosting":     GradientBoostingRegressor(random_state=RANDOM_STATE),
-    "HistGradientBoosting": HistGradientBoostingRegressor(random_state=RANDOM_STATE),
+    "DecisionTree":         DecisionTreeRegressor(random_state=tl.RANDOM_STATE),
+    "RandomForest":         RandomForestRegressor(random_state=tl.RANDOM_STATE, n_jobs=1),
+    "ExtraTrees":           ExtraTreesRegressor(random_state=tl.RANDOM_STATE, n_jobs=1),
+    "GradientBoosting":     GradientBoostingRegressor(random_state=tl.RANDOM_STATE),
+    "HistGradientBoosting": HistGradientBoostingRegressor(random_state=tl.RANDOM_STATE),
     "KNeighbors":           KNeighborsRegressor(n_jobs=1),
 }
 
 MODELES_CLASSIFICATION = {
     "LogisticRegression":   LogisticRegression(max_iter=1000),
-    "SVC":                  SVC(probability=True, random_state=RANDOM_STATE),
-    "DecisionTree":         DecisionTreeClassifier(random_state=RANDOM_STATE),
-    "RandomForest":         RandomForestClassifier(random_state=RANDOM_STATE, n_jobs=1),
-    "GradientBoosting":     GradientBoostingClassifier(random_state=RANDOM_STATE),
-    "HistGradientBoosting": HistGradientBoostingClassifier(random_state=RANDOM_STATE),
+    "SVC":                  SVC(probability=True, random_state=tl.RANDOM_STATE),
+    "DecisionTree":         DecisionTreeClassifier(random_state=tl.RANDOM_STATE),
+    "RandomForest":         RandomForestClassifier(random_state=tl.RANDOM_STATE, n_jobs=1),
+    "GradientBoosting":     GradientBoostingClassifier(random_state=tl.RANDOM_STATE),
+    "HistGradientBoosting": HistGradientBoostingClassifier(random_state=tl.RANDOM_STATE),
     "KNeighbors":           KNeighborsClassifier(n_jobs=1),
-}
-
-# ── Grilles de paramètres ─────────────────────
-PARAM_GRIDS_REGRESSION: dict[str, dict] = {
-    "Ridge": {"alpha": [0.01, 0.1, 1.0, 10.0, 100.0]},
-    "DecisionTree": {
-        "max_depth":         [3, 5, 8, 12, 18],
-        "min_samples_split": [2, 10, 50],
-        "min_samples_leaf":  [1, 5, 20],
-    },
-    "RandomForest": {
-        "n_estimators":     [100, 200],
-        "max_depth":        [5, 10, 15, 20],
-        "min_samples_leaf": [1, 5, 20],
-    },
-    "ExtraTrees": {
-        "n_estimators":     [100, 200],
-        "max_depth":        [5, 10, 15, 20],
-        "min_samples_leaf": [1, 5, 20],
-    },
-    "GradientBoosting": {
-        "n_estimators":  [100, 200],
-        "learning_rate": [0.05, 0.1, 0.2],
-        "max_depth":     [3, 5],
-    },
-    "HistGradientBoosting": {
-        "max_iter":          [100, 200],
-        "learning_rate":     [0.05, 0.1, 0.2],
-        "max_leaf_nodes":    [15, 31, 63],
-        "l2_regularization": [0.0, 0.1, 1.0],
-    },
-    "KNeighbors": {
-        "n_neighbors": [5, 10, 20, 50],
-        "weights":     ["uniform", "distance"],
-    },
-}
-
-PARAM_GRIDS_CLASSIFICATION: dict[str, dict] = {
-    "LogisticRegression": {"C": [0.01, 0.1, 1.0, 10.0]},
-    "SVC":                {"C": [0.1, 1.0, 10.0], "kernel": ["rbf", "linear"]},
-    "DecisionTree": {
-        "max_depth":         [3, 5, 8, 12],
-        "min_samples_split": [2, 10, 50],
-    },
-    "RandomForest": {
-        "n_estimators":     [100, 200],
-        "max_depth":        [5, 10, 15],
-        "min_samples_leaf": [1, 5],
-    },
-    "GradientBoosting": {
-        "n_estimators":  [100, 200],
-        "learning_rate": [0.05, 0.1],
-        "max_depth":     [3, 5],
-    },
-    "HistGradientBoosting": {
-        "max_iter":       [100, 200],
-        "learning_rate":  [0.05, 0.1],
-        "max_leaf_nodes": [15, 31],
-    },
-    "KNeighbors": {
-        "n_neighbors": [5, 10, 20, 50],
-        "weights":     ["uniform", "distance"],
-    },
 }
 
 
@@ -168,12 +94,12 @@ def charger(csv_path: str) -> pd.DataFrame:
         print(f"  CSV brut détecté ({len(header)} cols) — application du pipeline ML…")
         df = preparer_ml(csv_path)
 
-    df[TARGET] = pd.to_numeric(df[TARGET], errors="coerce")
+    df[tl.TARGET] = pd.to_numeric(df[tl.TARGET], errors="coerce")
     avant = len(df)
-    df = df.dropna(subset=[TARGET]).reset_index(drop=True)
+    df = df.dropna(subset=[tl.TARGET]).reset_index(drop=True)
     print(f"  Lignes conservées (retard_sec calculable) : {len(df):,} / {avant:,}")
 
-    for col in FEATURES:
+    for col in tl.FEATURES:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
         else:
@@ -187,12 +113,12 @@ def _charger_api() -> pd.DataFrame:
     print("  Mode API temps réel (snapshot unique)")
     df = collecter_snapshot_ml()
 
-    df[TARGET] = pd.to_numeric(df[TARGET], errors="coerce")
+    df[tl.TARGET] = pd.to_numeric(df[tl.TARGET], errors="coerce")
     avant = len(df)
-    df = df.dropna(subset=[TARGET]).reset_index(drop=True)
+    df = df.dropna(subset=[tl.TARGET]).reset_index(drop=True)
     print(f"  Lignes avec retard calculable : {len(df):,} / {avant:,}")
 
-    for col in FEATURES:
+    for col in tl.FEATURES:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
         else:
@@ -399,20 +325,20 @@ def _train_eval_classification(
 # ─────────────────────────────────────────────
 
 async def evaluer_regression(df: pd.DataFrame, label: str) -> pd.DataFrame:
-    cols = [c for c in FEATURES if c in df.columns]
+    cols = [c for c in tl.FEATURES if c in df.columns]
     X    = df[cols].values.astype(float)
-    y    = df[TARGET].to_numpy(dtype=float)
+    y    = df[tl.TARGET].to_numpy(dtype=float)
 
     cache = _lire_cache(_CACHE_REGRESSION)
     loop  = asyncio.get_event_loop()
 
     avec_cache  = [n for n in MODELES_REGRESSION if n in cache]
-    sans_cache  = [n for n in MODELES_REGRESSION if n in PARAM_GRIDS_REGRESSION and n not in cache]
-    sans_grille = [n for n in MODELES_REGRESSION if n not in PARAM_GRIDS_REGRESSION]
+    sans_cache  = [n for n in MODELES_REGRESSION if n in tl.PARAM_GRIDS_REGRESSION and n not in cache]
+    sans_grille = [n for n in MODELES_REGRESSION if n not in tl.PARAM_GRIDS_REGRESSION]
     print(f"  Cache     : {avec_cache  or '—'}")
     print(f"  GridSearch: {sans_cache  or '—'}")
     print(f"  Direct    : {sans_grille or '—'}")
-    print(f"  Évaluation : KFold k={N_FOLDS}  ({len(X):,} lignes)")
+    print(f"  Évaluation : KFold k={tl.N_FOLDS}  ({len(X):,} lignes)")
     print(f"  Lancement de {len(MODELES_REGRESSION)} modèles en parallèle…\n")
 
     executor = ProcessPoolExecutor()
@@ -421,15 +347,15 @@ async def evaluer_regression(df: pd.DataFrame, label: str) -> pd.DataFrame:
             executor,
             _train_eval_regression,
             nom, modele,
-            PARAM_GRIDS_REGRESSION.get(nom, {}),
+            tl.PARAM_GRIDS_REGRESSION.get(nom, {}),
             cache.get(nom),
             X, y,
-            SEUIL_PROCHE_S, label, N_FOLDS,
+            tl.SEUIL_PROCHE_S, label, tl.N_FOLDS,
         ): nom
         for nom, modele in MODELES_REGRESSION.items()
     }
 
-    proche_key = f"Proche≤{SEUIL_PROCHE_S}s (%)"
+    proche_key = f"Proche≤{tl.SEUIL_PROCHE_S}s (%)"
     lignes: list[dict] = []
 
     for future in asyncio.as_completed(futures):
@@ -467,14 +393,14 @@ async def evaluer_classification(df: pd.DataFrame, label: str) -> tuple[pd.DataF
     Retourne (DataFrame résultats, dict {nom_modèle: (_fpr, _tpr)})
     pour les courbes ROC.
     """
-    cols = [c for c in FEATURES if c in df.columns]
+    cols = [c for c in tl.FEATURES if c in df.columns]
     X    = df[cols].values.astype(float)
-    y    = (df[TARGET] >= SEUIL_RETARD).to_numpy(dtype=int)
+    y    = (df[tl.TARGET] >= tl.SEUIL_RETARD).to_numpy(dtype=int)
 
     n_pos = y.sum()
     n_neg = len(y) - n_pos
-    print(f"  Classe 0 (à l'heure) : {n_neg:,}  |  Classe 1 (retard >{SEUIL_RETARD}s) : {n_pos:,}")
-    print(f"  Évaluation : StratifiedKFold k={N_FOLDS}  ({len(X):,} lignes)")
+    print(f"  Classe 0 (à l'heure) : {n_neg:,}  |  Classe 1 (retard >{tl.SEUIL_RETARD}s) : {n_pos:,}")
+    print(f"  Évaluation : StratifiedKFold k={tl.N_FOLDS}  ({len(X):,} lignes)")
     print(f"  Lancement de {len(MODELES_CLASSIFICATION)} modèles en parallèle…\n")
 
     cache = _lire_cache(_CACHE_CLASSIFICATION)
@@ -495,11 +421,11 @@ async def evaluer_classification(df: pd.DataFrame, label: str) -> tuple[pd.DataF
             executor,
             _train_eval_classification,
             nom, modele,
-            PARAM_GRIDS_CLASSIFICATION.get(nom, {}),
+            tl.PARAM_GRIDS_CLASSIFICATION.get(nom, {}),
             cache.get(nom),
             X_svc if nom == "SVC" else X,
             y_svc if nom == "SVC" else y,
-            N_FOLDS,
+            tl.N_FOLDS,
         ): nom
         for nom, modele in MODELES_CLASSIFICATION.items()
     }
@@ -569,8 +495,8 @@ def tracer_matrices_confusion(cm_data: dict, horodatage: str) -> list[str]:
         fig.colorbar(im, ax=ax, shrink=0.8)
 
         ax.set_title(
-            f"{nom}\nMatrice de confusion — retard > {SEUIL_RETARD}s\n"
-            f"(agrégée sur {N_FOLDS} folds StratifiedKFold)",
+            f"{nom}\nMatrice de confusion — retard > {tl.SEUIL_RETARD}s\n"
+            f"(agrégée sur {tl.N_FOLDS} folds StratifiedKFold)",
             fontsize=10, fontweight="bold",
         )
         ax.set_xlabel("Prédit", fontsize=9)
@@ -613,8 +539,8 @@ def tracer_courbes_roc(roc_data: dict, horodatage: str) -> str:
 
     ax.set_xlabel("Taux de faux positifs (FPR)", fontsize=12)
     ax.set_ylabel("Taux de vrais positifs (TPR)", fontsize=12)
-    ax.set_title(f"Courbes ROC — Classification retard > {SEUIL_RETARD}s\n"
-                 f"(moyenne sur {N_FOLDS} folds StratifiedKFold)", fontsize=13)
+    ax.set_title(f"Courbes ROC — Classification retard > {tl.SEUIL_RETARD}s\n"
+                 f"(moyenne sur {tl.N_FOLDS} folds StratifiedKFold)", fontsize=13)
     ax.legend(loc="lower right", fontsize=10)
     ax.set_xlim(0, 1)
     ax.set_ylim(0, 1)
@@ -643,7 +569,7 @@ async def main():
 
     df = charger(args.csv) if args.csv else _charger_api()
 
-    if len(df) < N_FOLDS * 2:
+    if len(df) < tl.N_FOLDS * 2:
         print(f"  Pas assez de données ({len(df)} lignes). Abandon.")
         return
 
@@ -662,7 +588,7 @@ async def main():
 
     res_reg = await evaluer_regression(df, "ML-ready")
 
-    proche_col = f"Proche≤{SEUIL_PROCHE_S}s (%)"
+    proche_col = f"Proche≤{tl.SEUIL_PROCHE_S}s (%)"
     _afficher_classements_regression(res_reg, proche_col)
 
     out_csv_reg = os.path.join(_DOSSIER, f"resultats_regression_{horodatage}.csv")
@@ -675,9 +601,9 @@ async def main():
         horodatage   = horodatage,
         csv_source   = args.csv,
         n_lignes     = len(df),
-        features     = FEATURES,
-        n_folds      = N_FOLDS,
-        seuil_proche = SEUIL_PROCHE_S,
+        features     = tl.FEATURES,
+        n_folds      = tl.N_FOLDS,
+        seuil_proche = tl.SEUIL_PROCHE_S,
     )
     print(f"Rapport Markdown régression → {out_md_reg}")
 
@@ -685,7 +611,7 @@ async def main():
     # CLASSIFICATION
     # ══════════════════════════════════════════
     print("\n" + "=" * 65)
-    print(f"  CLASSIFICATION  (cible : retard > {SEUIL_RETARD}s)")
+    print(f"  CLASSIFICATION  (cible : retard > {tl.EUIL_RETARD}s)")
     print("=" * 65)
 
     res_clf, roc_data, cm_data = await evaluer_classification(df, "ML-ready")
@@ -709,9 +635,9 @@ async def main():
         horodatage   = horodatage,
         csv_source   = args.csv,
         n_lignes     = len(df),
-        features     = FEATURES,
-        n_folds      = N_FOLDS,
-        seuil_retard = SEUIL_RETARD,
+        features     = tl.FEATURES,
+        n_folds      = tl.N_FOLDS,
+        seuil_retard = tl.SEUIL_RETARD,
         roc_png      = os.path.basename(out_roc),
         cm_pngs      = [os.path.basename(p) for p in out_cms],
     )
@@ -724,7 +650,7 @@ def _afficher_classements_regression(resultats: pd.DataFrame, proche_col: str) -
         ("MAE (s)",  False, "MAE en secondes (↓ mieux)"),
         ("RMSE (s)", False, "RMSE (↓ mieux)"),
         ("MAPE (%)", False, "MAPE en % (↓ mieux)"),
-        (proche_col, True,  f"Proche≤{SEUIL_PROCHE_S}s % (↑ mieux)"),
+        (proche_col, True,  f"Proche≤{tl.SEUIL_PROCHE_S}s % (↑ mieux)"),
     ]
     for col, desc_asc, titre in metriques:
         std_col = col + " ±"

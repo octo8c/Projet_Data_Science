@@ -33,6 +33,8 @@ import requests
 from sklearn.preprocessing import TargetEncoder
 from sklearn.model_selection import train_test_split
 
+import tools as tl
+
 # ─────────────────────────────────────────────
 # CONFIGURATION
 # ─────────────────────────────────────────────
@@ -57,41 +59,6 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────────
-# RÉFÉRENTIEL DES LIGNES
-# ─────────────────────────────────────────────
-
-LIGNES = {
-    # Métro
-    "Métro 1":  "STIF:Line::C01371:", "Métro 2":  "STIF:Line::C01372:",
-    "Métro 3":  "STIF:Line::C01373:", "Métro 3b": "STIF:Line::C01386:",
-    "Métro 4":  "STIF:Line::C01374:", "Métro 5":  "STIF:Line::C01375:",
-    "Métro 6":  "STIF:Line::C01376:", "Métro 7":  "STIF:Line::C01377:",
-    "Métro 7b": "STIF:Line::C01387:", "Métro 8":  "STIF:Line::C01378:",
-    "Métro 9":  "STIF:Line::C01379:", "Métro 10": "STIF:Line::C01380:",
-    "Métro 11": "STIF:Line::C01381:", "Métro 12": "STIF:Line::C01382:",
-    "Métro 13": "STIF:Line::C01383:", "Métro 14": "STIF:Line::C01384:",
-    # RER
-    "RER A": "STIF:Line::C01742:", "RER B": "STIF:Line::C01743:",
-    "RER C": "STIF:Line::C01727:", "RER D": "STIF:Line::C01728:",
-    "RER E": "STIF:Line::C01729:",
-    # Transilien
-    "Ligne H": "STIF:Line::C01737:", "Ligne J": "STIF:Line::C01738:",
-    "Ligne K": "STIF:Line::C01739:", "Ligne L": "STIF:Line::C01740:",
-    "Ligne N": "STIF:Line::C01741:", "Ligne P": "STIF:Line::C01744:",
-    "Ligne R": "STIF:Line::C01745:", "Ligne U": "STIF:Line::C01746:",
-    # Tramway
-    "Tram T1":  "STIF:Line::C01389:", "Tram T2":  "STIF:Line::C01390:",
-    "Tram T3a": "STIF:Line::C01391:", "Tram T3b": "STIF:Line::C01679:",
-    "Tram T4":  "STIF:Line::C01392:", "Tram T5":  "STIF:Line::C01775:",
-    "Tram T6":  "STIF:Line::C01776:", "Tram T7":  "STIF:Line::C01777:",
-    "Tram T8":  "STIF:Line::C01778:", "Tram T9":  "STIF:Line::C02317:",
-    "Tram T10": "STIF:Line::C02316:", "Tram T11": "STIF:Line::C02024:",
-    "Tram T13": "STIF:Line::C02048:",
-}
-
-LIGNES_PAR_REF = {ref: nom for nom, ref in LIGNES.items()}
-
-# ─────────────────────────────────────────────
 # MAPPING ÉTENDU DEPUIS GTFS (couvre tous les bus, trams, etc.)
 # ─────────────────────────────────────────────
 def _build_gtfs_mapping() -> "dict[str, str]":
@@ -103,7 +70,7 @@ def _build_gtfs_mapping() -> "dict[str, str]":
     _out: dict[str, str] = {}
     for _, r in _routes.iterrows():
         _ref = "STIF:Line::" + str(r["route_id"]).replace("IDFM:", "") + ":"
-        if _ref not in LIGNES_PAR_REF:  # ne pas écraser les noms explicites
+        if _ref not in tl.LIGNES_PAR_REF:  # ne pas écraser les noms explicites
             _p = _prefixe.get(str(r["route_type"]), "Ligne")
             _n = str(r["route_short_name"]).strip()
             _out[_ref] = f"{_p} {_n}" if _n else _p
@@ -113,102 +80,11 @@ _GTFS_LIGNES = _build_gtfs_mapping()
 
 def resoudre_nom_ligne(line_ref: str) -> str:
     """Nom lisible d'une ligne : LIGNES_PAR_REF en priorité, puis GTFS."""
-    return LIGNES_PAR_REF.get(line_ref) or _GTFS_LIGNES.get(line_ref, "")
-
-# ─────────────────────────────────────────────
-# COLONNES CSV BRUT (collecte)
-# ─────────────────────────────────────────────
-
-CSV_COLONNES = [
-    "line_ref", "nom_ligne", "operateur", "direction_ref", "terminus",
-    "stop_ref", "nom_arret",
-    "horaire_arrivee_prevu", "horaire_depart_prevu",
-    "horaire_arrivee_estime", "horaire_depart_estime",
-    "arrivee_prevue_hhmm", "depart_prevu_hhmm", "depart_estime_hhmm",
-    "jour_semaine", "heure_tranche", "periode_journee",
-    "alerte_active", "categorie_alerte", "date_capture",
-    "retard_sec",
-]
-
+    return tl.LIGNES_PAR_REF.get(line_ref) or _GTFS_LIGNES.get(line_ref, "")
 
 # ══════════════════════════════════════════════════════════════
 # PARTIE 1 — COLLECTE API
 # ══════════════════════════════════════════════════════════════
-
-JOURS = ["Lundi", "Mardi", "Mercredi", "Jeudi", "Vendredi", "Samedi", "Dimanche"]
-
-
-def _val(field) -> str:
-    """Dépaquète les formats SIRI hybrides (str, dict, list)."""
-    if field is None:
-        return ""
-    if isinstance(field, str):
-        return field.strip().replace('\r', ' ').replace('\n', ' ')
-    if isinstance(field, dict):
-        return str(field.get("value", "")).strip().replace('\r', ' ').replace('\n', ' ')
-    if isinstance(field, list):
-        parts = [
-            str(item.get("value", "")).strip() if isinstance(item, dict) else str(item).strip()
-            for item in field
-        ]
-        return " / ".join(p for p in parts if p).replace('\r', ' ').replace('\n', ' ')
-    return str(field).strip().replace('\r', ' ').replace('\n', ' ')
-
-
-def fmt_hhmm(iso: str | None) -> str:
-    if not iso:
-        return ""
-    try:
-        return datetime.fromisoformat(iso.replace("Z", "+00:00")).strftime("%H:%M")
-    except Exception:
-        return ""
-
-
-def _periode(h: int) -> str:
-    if h < 6:   return "Nuit"
-    if h < 9:   return "Pointe matin"
-    if h < 11:  return "Creuse matin"
-    if h < 14:  return "Méridienne"
-    if h < 16:  return "Creuse après-midi"
-    if h < 20:  return "Pointe soir"
-    return "Soirée"
-
-
-def _calc_retard_sec(prevu: str, estime: str) -> int | None:
-    """Retourne (estime - prevu) en secondes entiers, ou None si l'un des deux est absent."""
-    if not prevu or not estime:
-        return None
-    try:
-        t_prev = datetime.fromisoformat(prevu.replace("Z", "+00:00"))
-        t_est  = datetime.fromisoformat(estime.replace("Z", "+00:00"))
-        return int(round((t_est - t_prev).total_seconds()))
-    except Exception:
-        return None
-
-
-def _enrichissement_temporel(heure_ref: str) -> tuple:
-    """Retourne (heure_tranche, periode_journee) depuis une chaîne ISO."""
-    if not heure_ref:
-        return "", ""
-    try:
-        h = datetime.fromisoformat(heure_ref.replace("Z", "+00:00")).hour
-        return h, _periode(h)
-    except Exception:
-        return "", ""
-
-
-def _parse_calls(journey: dict) -> list:
-    """Extrait tous les appels (RecordedCall + EstimatedCall) d'une course."""
-    def normalise(bloc, key):
-        data = bloc.get(key, [])
-        if isinstance(data, dict):
-            data = [data]
-        return data or []
-
-    recorded  = normalise(journey.get("RecordedCalls", {}), "RecordedCall")
-    estimated = normalise(journey.get("EstimatedCalls", {}), "EstimatedCall")
-    return [(c, True) for c in recorded] + [(c, False) for c in estimated]
-
 
 def _parse_journey(
     journey: dict,
@@ -218,10 +94,10 @@ def _parse_journey(
     ref_arrets: "dict[str, str] | None" = None,
 ) -> list[dict]:
     """Transforme une EstimatedVehicleJourney en liste de lignes CSV."""
-    line_ref    = _val(journey.get("LineRef"))
-    operateur   = _val(journey.get("OperatorRef"))
-    direction   = _val(journey.get("DirectionRef"))
-    terminus    = _val(journey.get("DestinationName"))
+    line_ref    = tl._val(journey.get("LineRef"))
+    operateur   = tl._val(journey.get("OperatorRef"))
+    direction   = tl._val(journey.get("DirectionRef"))
+    terminus    = tl._val(journey.get("DestinationName"))
 
     alerte_info      = alertes_map.get(line_ref, {})
     alerte_active    = alerte_info.get("alerte_active", False)
@@ -231,18 +107,18 @@ def _parse_journey(
     nom_ligne = resoudre_nom_ligne(line_ref)
 
     rows = []
-    for call, _ in _parse_calls(journey):
-        aimed_arr = _val(call.get("AimedArrivalTime"))
-        aimed_dep = _val(call.get("AimedDepartureTime"))
-        exp_arr   = _val(call.get("ExpectedArrivalTime"))
-        exp_dep   = _val(call.get("ExpectedDepartureTime"))
+    for call, _ in tl._parse_calls(journey):
+        aimed_arr = tl._val(call.get("AimedArrivalTime"))
+        aimed_dep = tl._val(call.get("AimedDepartureTime"))
+        exp_arr   = tl._val(call.get("ExpectedArrivalTime"))
+        exp_dep   = tl._val(call.get("ExpectedDepartureTime"))
 
         heure_ref            = aimed_dep or aimed_arr or exp_dep or exp_arr
-        h_tranche, h_periode = _enrichissement_temporel(heure_ref)
+        h_tranche, h_periode = tl._enrichissement_temporel(heure_ref)
 
         # nom_arret : priorité à StopPointName, fallback sur référentiel (même logique que build_features)
-        stop_ref  = _val(call.get("StopPointRef"))
-        nom_arret = _val(call.get("StopPointName"))
+        stop_ref  = tl._val(call.get("StopPointRef"))
+        nom_arret = tl._val(call.get("StopPointName"))
         if not nom_arret and ref_arrets:
             import re as _re
             m = _re.search(r":(?:Q|BP):(\d+):", stop_ref)
@@ -261,16 +137,16 @@ def _parse_journey(
             "horaire_depart_prevu":   aimed_dep,
             "horaire_arrivee_estime": exp_arr,
             "horaire_depart_estime":  exp_dep,
-            "arrivee_prevue_hhmm":    fmt_hhmm(aimed_arr),
-            "depart_prevu_hhmm":      fmt_hhmm(aimed_dep),
-            "depart_estime_hhmm":     fmt_hhmm(exp_dep),
-            "jour_semaine":           JOURS[now_local.weekday()],
+            "arrivee_prevue_hhmm":    tl.fmt_hhmm(aimed_arr),
+            "depart_prevu_hhmm":      tl.fmt_hhmm(aimed_dep),
+            "depart_estime_hhmm":     tl.fmt_hhmm(exp_dep),
+            "jour_semaine":           tl.JOURS[now_local.weekday()],
             "heure_tranche":          h_tranche,
             "periode_journee":        h_periode,
             "alerte_active":          alerte_active,
             "categorie_alerte":       categorie_alerte,
             "date_capture":           now_capture,
-            "retard_sec":             _calc_retard_sec(aimed_arr, exp_arr),
+            "retard_sec":             tl._calc_retard_sec(aimed_arr, exp_arr),
         })
     return rows
 
@@ -337,10 +213,10 @@ def ecrire_csv(rows: list[dict], csv_path: str = CSV_FILE):
                 _existing_header = next(csv.reader(_f))
             except StopIteration:
                 _existing_header = []
-        if _existing_header and _existing_header != CSV_COLONNES:
+        if _existing_header and _existing_header != tl.CSV_COLONNES:
             raise ValueError(
                 f"Incompatibilité de schéma CSV !\n"
-                f"  Header existant ({len(_existing_header)} cols) ≠ schéma courant ({len(CSV_COLONNES)} cols).\n"
+                f"  Header existant ({len(_existing_header)} cols) ≠ schéma courant ({len(tl.CSV_COLONNES)} cols).\n"
                 f"  Fichier : {os.path.abspath(csv_path)}\n"
                 f"  Action  : renommer ou supprimer le fichier puis relancer la collecte."
             )
@@ -348,7 +224,7 @@ def ecrire_csv(rows: list[dict], csv_path: str = CSV_FILE):
     nouveau = not os.path.exists(csv_path)
     os.makedirs(os.path.dirname(csv_path) or ".", exist_ok=True)
     with open(csv_path, "a", newline="", encoding="utf-8-sig") as f:
-        writer = csv.DictWriter(f, fieldnames=CSV_COLONNES, extrasaction="ignore",
+        writer = csv.DictWriter(f, fieldnames=tl.CSV_COLONNES, extrasaction="ignore",
                                 lineterminator="\n")
         if nouveau:
             writer.writeheader()
@@ -438,7 +314,7 @@ def collecter_en_continu(duree_heures: float | None = None,csv_file = CSV_FILE):
     limite = duree_heures * 3600 if duree_heures else None
 
     log.info("=" * 55)
-    log.info(f"  Collecte continue — {len(LIGNES)} lignes configurées")
+    log.info(f"  Collecte continue — {len(tl.LIGNES)} lignes configurées")
     log.info(f"  Fichier CSV : {os.path.abspath(csv_file)}")
     log.info(f"  Intervalle  : {INTERVALLE_CYCLE}s  |  Ctrl+C pour arrêter")
     log.info("=" * 55)
@@ -469,40 +345,7 @@ def collecter_en_continu(duree_heures: float | None = None,csv_file = CSV_FILE):
 
 # ══════════════════════════════════════════════════════════════
 # PARTIE 2 — FEATURE ENGINEERING
-# ══════════════════════════════════════════════════════════════
-
-# Jours fériés français 2025-2026
-_JOURS_FERIES = {
-    "2025-01-01", "2025-04-21", "2025-05-01", "2025-05-08", "2025-05-29",
-    "2025-06-09", "2025-07-14", "2025-08-15", "2025-11-01", "2025-11-11", "2025-12-25",
-    "2026-01-01", "2026-04-06", "2026-05-01", "2026-05-08", "2026-05-14",
-    "2026-05-25", "2026-07-14", "2026-08-15", "2026-11-01", "2026-11-11", "2026-12-25",
-}
-
-
-def _wmo_groupe(code) -> str:
-    """Réduit les codes WMO (0-99) en 7 groupes interprétables pour le ML."""
-    if code is None or (isinstance(code, float) and pd.isna(code)):
-        return "inconnu"
-    c = int(code)
-    if c == 0:              return "ensoleille"
-    if c <= 3:              return "nuageux"
-    if c in (45, 48):       return "brouillard"
-    if 51 <= c <= 67:       return "pluie"
-    if 71 <= c <= 77:       return "neige"
-    if 80 <= c <= 82:       return "averses"
-    if 95 <= c <= 99:       return "orage"
-    return "autre"
-
-
-_KEYWORDS_ALERTE = {
-    "greve":    ["grève", "greve", "préavis", "mouvement social"],
-    "incident": ["incident", "accident", "avarie", "panne", "défaillance", "défaut"],
-    "travaux":  ["travaux", "chantier", "fermeture", "coupure", "interruption"],
-    "meteo":    ["météo", "neige", "verglas", "vent", "inondation", "chaleur", "canicule"],
-    "voyageur": ["malaise voyageur", "bagage", "colis", "urgence médicale"],
-    "retard":   ["retard", "perturbation", "ralentissement", "trafic perturbé", "allongement"],
-}
+# ═════════════════════════════════════════════════════════════
 
 
 def _classifier_alerte(texte: str) -> str:
@@ -510,7 +353,7 @@ def _classifier_alerte(texte: str) -> str:
     if not texte:
         return "autre"
     t = texte.lower()
-    for cat, mots in _KEYWORDS_ALERTE.items():
+    for cat, mots in tl._KEYWORDS_ALERTE.items():
         if any(m in t for m in mots):
             return cat
     return "autre"
@@ -518,7 +361,7 @@ def _classifier_alerte(texte: str) -> str:
 
 def _cat_jour(date_str, weekday: int) -> str:
     """Retourne la catégorie jour IDFM (DIJFP / SAHV / JOHV)."""
-    if isinstance(date_str, str) and date_str[:10] in _JOURS_FERIES or weekday == 6:
+    if isinstance(date_str, str) and date_str[:10] in tl._JOURS_FERIES or weekday == 6:
         return "DIJFP"
     if weekday == 5:
         return "SAHV"
@@ -598,57 +441,6 @@ def _fetch_meteo_paris_horaire(dates: "list[str]") -> "dict[tuple, dict]":
 
     return result
 
-
-def _target_encode_terminus(df: pd.DataFrame) -> pd.DataFrame:
-    """Encode la colonne 'terminus' par le retard moyen observé (target encoding)."""
-    global_mean = df["retard_sec"].mean(skipna=True)
-    if pd.isna(global_mean):
-        global_mean = 0.0
-    terminus_clean = df["terminus"].fillna("_inconnu").str.strip().where(
-        df["terminus"].notna() & (df["terminus"].str.strip() != ""), other="_inconnu"
-    )
-    means = df.groupby(terminus_clean)["retard_sec"].mean()
-    df["terminus_encoded"] = terminus_clean.map(means).fillna(global_mean)
-    return df
-
-
-def _target_encode_station(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Encode stop_ref par le retard moyen observé à cet arrêt (target encoding).
-    Capture l'effet propre à chaque station indépendamment de la ligne.
-    Les arrêts sans retard observé reçoivent le retard moyen global.
-    """
-    global_mean = df["retard_sec"].mean(skipna=True)
-    if pd.isna(global_mean):
-        global_mean = 0.0
-    stop_clean = df["stop_ref"].fillna("_inconnu").astype(str).str.strip()
-    stop_clean = stop_clean.where(stop_clean != "", other="_inconnu")
-    means = df.groupby(stop_clean)["retard_sec"].mean()
-    df["station_encoded"] = stop_clean.map(means).fillna(global_mean)
-    
-    TargetEncoder()
-    return df
-
-def target_encode(df:pd.DataFrame,categorical_features:list,target:str) -> pd.DataFrame:
-    """_summary_
-
-    Args:
-        df (pd.DataFrame): _description_
-        categorical_features (list): _description_
-
-    Returns:
-        pd.DataFrame: _description_
-    """
-    te = TargetEncoder(categories='auto',target_type='continuous',cv=5,smooth='auto',random_state=42)
-    y = df[target]
-    X = df[categorical_features]
-    X_train,X_test,y_train,y_test = train_test_split(X,y,train_size=.80)
-    te.fit(X_train,y_train)
-    te.transform(X_train)
-    te.transform(X_test)
-    return df
-
-
 def _charger_referentiel_arrets() -> "dict[str, str]":
     """
     Retourne un dict {id_numerique: nom_arret} pour tous les arrêts IDFM.
@@ -702,10 +494,10 @@ def build_features(csv_path: str = CSV_FILE) -> pd.DataFrame:
     with open(csv_path, "r", encoding="utf-8-sig", errors="replace") as _f:
         _file_header = next(csv.reader(_f))
 
-    if _file_header != CSV_COLONNES:
+    if _file_header != tl.CSV_COLONNES:
         raise ValueError(
             f"Schéma CSV incompatible !\n"
-            f"  Header fichier ({len(_file_header)} cols) ≠ schéma courant ({len(CSV_COLONNES)} cols).\n"
+            f"  Header fichier ({len(_file_header)} cols) ≠ schéma courant ({len(tl.CSV_COLONNES)} cols).\n"
             f"  Fichier : {os.path.abspath(csv_path)}\n"
             f"  Action  : supprimer ou remplacer le fichier, puis relancer la collecte."
         )
@@ -734,7 +526,7 @@ def build_features(csv_path: str = CSV_FILE) -> pd.DataFrame:
     df["_heure_int"] = ref_dt.dt.hour
 
     # 4. Jour férié
-    df["jour_ferie"] = df["_date_str"].isin(_JOURS_FERIES)
+    df["jour_ferie"] = df["_date_str"].isin(tl._JOURS_FERIES)
 
     # 5. Météo horaire Paris
     meteo_map = _fetch_meteo_paris_horaire(df["_date_str"].dropna().tolist())
@@ -743,7 +535,7 @@ def build_features(csv_path: str = CSV_FILE) -> pd.DataFrame:
     df["snowfall"]      = [meteo_map.get((d, h), {}).get("snowfall")      for d, h in zip(df["_date_str"], df["_heure_int"])]
     df["wind_speed"]    = [meteo_map.get((d, h), {}).get("wind_speed")    for d, h in zip(df["_date_str"], df["_heure_int"])]
     df["temperature"]   = [meteo_map.get((d, h), {}).get("temperature")   for d, h in zip(df["_date_str"], df["_heure_int"])]
-    df["meteo_groupe"]  = df["weathercode"].apply(_wmo_groupe)
+    df["meteo_groupe"]  = df["weathercode"].apply(tl._wmo_groupe)
 
     # 6. Direction numérique (1 = aller, 2 = retour, 0 = inconnu)
     #    L'API PRIM renvoie du texte ("Aller"/"Retour"/"outbound"/"inbound"/"A"/"R")
@@ -760,8 +552,8 @@ def build_features(csv_path: str = CSV_FILE) -> pd.DataFrame:
     df["heure_tranche"] = pd.to_numeric(df["heure_tranche"], errors="coerce").fillna(0).astype(int)
 
     # 8. Target encoding du terminus et de la station (arrêt)
-    df = _target_encode_terminus(df)
-    df = _target_encode_station(df)
+    df = tl._target_encode_terminus(df)
+    df = tl._target_encode_station(df)
 
     # 9. Alertes réseau
     if "alerte_active" not in df.columns:
@@ -821,69 +613,11 @@ def build_features(csv_path: str = CSV_FILE) -> pd.DataFrame:
 # PARTIE 3 — IMPUTATION DES VALEURS MANQUANTES
 # ══════════════════════════════════════════════════════════════
 
-def impute_missing(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Impute les valeurs manquantes :
-      C — meteo_groupe     : 'inconnu'
-      C — categorie_alerte : 'aucune'
-      N — météo continues, terminus_encoded : mean global
-      N — occupation : moyenne groupée (ligne × heure) puis SimpleImputer global
-    """
-    from sklearn.impute import SimpleImputer
-
-    df["meteo_groupe"]     = df["meteo_groupe"].fillna("inconnu")
-    df["categorie_alerte"] = df["categorie_alerte"].fillna("aucune")
-
-    for col in ["precipitation", "snowfall", "wind_speed", "temperature", "terminus_encoded", "station_encoded"]:
-        if col in df.columns and df[col].isna().any():
-            df[col] = df[col].fillna(df[col].mean())
-
-    # Occupation : 1re passe groupée, 2e passe globale
-    df["occupation"] = df["occupation"].fillna(
-        df.groupby(["nom_ligne", "heure_tranche"])["occupation"].transform("mean")
-    )
-    if df["occupation"].isna().any():
-        df[["occupation"]] = SimpleImputer(strategy="mean").fit_transform(df[["occupation"]])
-
-    return df
-
+#Fonction impute_missings dans tools.py
 
 # ══════════════════════════════════════════════════════════════
 # PARTIE 4 — ENCODAGE & PRÉPARATION ML
 # ══════════════════════════════════════════════════════════════
-
-# Mappings entiers fixes pour chaque colonne catégorielle.
-# Déterministes : le même code sera assigné indépendamment du dataset traité.
-# Valeur inconnue → -1 (jamais vu à l'entraînement mais géré par les modèles).
-CAT_ENCODINGS: dict[str, dict[str, int]] = {
-    "nom_ligne": {
-        nom: i for i, nom in enumerate(["_inconnu"] + sorted(LIGNES.keys()))
-    },
-    "jour_semaine": {j: i for i, j in enumerate(JOURS)},
-    "periode_journee": {
-        "Nuit": 0, "Pointe matin": 1, "Creuse matin": 2, "Méridienne": 3,
-        "Creuse après-midi": 4, "Pointe soir": 5, "Soirée": 6,
-    },
-    "meteo_groupe": {
-        "ensoleille": 0, "nuageux": 1, "brouillard": 2, "pluie": 3,
-        "neige": 4, "averses": 5, "orage": 6, "autre": 7, "inconnu": 8,
-    },
-    "categorie_alerte": {
-        "aucune": 0, "greve": 1, "incident": 2, "travaux": 3,
-        "meteo": 4, "retard": 5, "voyageur": 6, "autre": 7,
-    },
-}
-
-# Colonnes du CSV ML-ready (dans l'ordre final)
-ML_COLONNES = [
-    # Target
-    "retard_sec",
-    # Numériques
-    "direction_ref", "terminus_encoded", "station_encoded", "heure_tranche", "mois",
-    "jour_ferie", "precipitation", "snowfall", "wind_speed", "temperature", "occupation",
-    # Catégorielles encodées (int)
-    "nom_ligne", "jour_semaine", "periode_journee", "meteo_groupe", "categorie_alerte",
-]
 
 
 def encoder_categoriques(df: pd.DataFrame) -> pd.DataFrame:
@@ -893,7 +627,7 @@ def encoder_categoriques(df: pd.DataFrame) -> pd.DataFrame:
     Booléens (jour_ferie, alerte_active) → 0 / 1.
     """
     df = df.copy()
-    for col, mapping in CAT_ENCODINGS.items():
+    for col, mapping in tl.CAT_ENCODINGS.items():
         if col not in df.columns:
             continue
         serie = df[col].fillna("_inconnu").astype(str).str.strip()
@@ -935,23 +669,23 @@ def preparer_ml(
     log.info(f"  Feature engineering sur : {csv_path}")
     df = build_features(csv_path)
     log.info(f"  {len(df):,} lignes chargées — imputation NaN…")
-    df = impute_missing(df)
+    df = tl.impute_missing(df)
     log.info("  Encodage des variables catégorielles…")
     df = encoder_categoriques(df)
 
     # Sélectionner uniquement les colonnes ML (dans l'ordre défini)
-    cols_presentes = [c for c in ML_COLONNES if c in df.columns]
-    cols_manquantes = [c for c in ML_COLONNES if c not in df.columns]
+    cols_presentes = [c for c in tl.ML_COLONNES if c in df.columns]
+    cols_manquantes = [c for c in tl.ML_COLONNES if c not in df.columns]
     if cols_manquantes:
         log.warning(f"  Colonnes absentes (mises à 0) : {cols_manquantes}")
         for c in cols_manquantes:
             df[c] = 0
-    df = df[ML_COLONNES].copy()
+    df = df[tl.ML_COLONNES].copy()
 
     # Conversion numérique stricte : tout devient float (NaN résiduels → 0 sauf retard_sec)
-    for col in ML_COLONNES:
+    for col in tl.ML_COLONNES:
         df[col] = pd.to_numeric(df[col], errors="coerce")
-    for col in [c for c in ML_COLONNES if c != "retard_sec"]:
+    for col in [c for c in tl.ML_COLONNES if c != "retard_sec"]:
         df[col] = df[col].fillna(0.0)
 
     nan_retard = df["retard_sec"].isna().sum()
@@ -992,7 +726,7 @@ def collecter_snapshot_ml() -> pd.DataFrame:
         mode="w", suffix=".csv", delete=False, encoding="utf-8-sig", newline=""
     ) as _f:
         _tmp = _f.name
-        writer = csv.DictWriter(_f, fieldnames=CSV_COLONNES,
+        writer = csv.DictWriter(_f, fieldnames=tl.CSV_COLONNES,
                                 extrasaction="ignore", lineterminator="\n")
         writer.writeheader()
         writer.writerows(rows)
