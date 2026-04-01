@@ -73,7 +73,7 @@ CSV_COLONNES = [
 # ─────────────────────────────────────────────
 # COLONNES CSV
 # ─────────────────────────────────────────────
-CSV_COLONNES_COL = [
+CSV_COLONNES_COLLECTE = [
     # — Contexte de collecte —
     "timestamp_collecte",       # Quand on a fait la requête
     "timestamp_utc",            # Idem en UTC
