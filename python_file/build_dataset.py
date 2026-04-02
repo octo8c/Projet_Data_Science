@@ -28,6 +28,7 @@ import time
 import logging
 from datetime import datetime, timezone
 
+import numpy as np
 import pandas as pd
 import requests
 from sklearn.preprocessing import TargetEncoder
@@ -329,6 +330,15 @@ def get_estimated_timetable() -> list[dict]:
     return rows
 
 
+def filter_line(rows: list[dict]) -> list[dict]:
+    """Filtre les entrées pour ne garder que les lignes à surveiller (définies dans LIGNES)."""
+    lignes_surveillees = set(LIGNES.keys())
+    avant = len(rows)
+    rows = [r for r in rows if r.get("nom_ligne") in lignes_surveillees]
+    log.info(f"  filter_line : {avant} → {len(rows)} entrées (lignes non surveillées retirées)")
+    return rows
+
+
 def ecrire_csv(rows: list[dict], csv_path: str = CSV_FILE):
     """Écrit les lignes dans le CSV brut (création ou append). Vérifie la compatibilité du schéma."""
     if os.path.exists(csv_path):
@@ -449,6 +459,7 @@ def collecter_en_continu(duree_heures: float | None = None,csv_file = CSV_FILE):
             log.info(f"\n[Cycle {cycle}] {datetime.now().strftime('%H:%M:%S')}")
             try:
                 rows = get_estimated_timetable()
+                rows = filter_line(rows)
                 ecrire_csv(rows,csv_file)
                 log.info(f"  {len(rows)} lignes écrites")
             except requests.HTTPError as e:
@@ -471,13 +482,42 @@ def collecter_en_continu(duree_heures: float | None = None,csv_file = CSV_FILE):
 # PARTIE 2 — FEATURE ENGINEERING
 # ══════════════════════════════════════════════════════════════
 
-# Jours fériés français 2025-2026
+# Jours fériés français 2024-2026
 _JOURS_FERIES = {
+    "2024-01-01", "2024-04-01", "2024-05-01", "2024-05-08", "2024-05-09",
+    "2024-05-20", "2024-07-14", "2024-08-15", "2024-11-01", "2024-11-11", "2024-12-25",
     "2025-01-01", "2025-04-21", "2025-05-01", "2025-05-08", "2025-05-29",
     "2025-06-09", "2025-07-14", "2025-08-15", "2025-11-01", "2025-11-11", "2025-12-25",
     "2026-01-01", "2026-04-06", "2026-05-01", "2026-05-08", "2026-05-14",
     "2026-05-25", "2026-07-14", "2026-08-15", "2026-11-01", "2026-11-11", "2026-12-25",
 }
+
+# Vacances scolaires IDF (zone C) 2024-2026
+_VACANCES_IDF = [
+    ("2024-10-19", "2024-11-04"),  # Toussaint 2024
+    ("2024-12-21", "2025-01-06"),  # Noël 2024
+    ("2025-02-22", "2025-03-10"),  # Hiver 2025
+    ("2025-04-19", "2025-05-05"),  # Printemps 2025
+    ("2025-07-05", "2025-09-01"),  # Été 2025
+    ("2025-10-18", "2025-11-03"),  # Toussaint 2025
+    ("2025-12-20", "2026-01-05"),  # Noël 2025
+    ("2026-02-14", "2026-03-02"),  # Hiver 2026
+    ("2026-04-11", "2026-04-27"),  # Printemps 2026
+    ("2026-07-04", "2026-08-31"),  # Été 2026
+]
+
+
+def est_jour_ferie(date_str: str) -> bool:
+    """Retourne True si date_str (YYYY-MM-DD) est un jour férié français."""
+    return isinstance(date_str, str) and date_str[:10] in _JOURS_FERIES
+
+
+def est_vacances(date_str: str) -> bool:
+    """Retourne True si date_str (YYYY-MM-DD) tombe dans les vacances scolaires IDF (zone C)."""
+    if not isinstance(date_str, str) or len(date_str) < 10:
+        return False
+    d = date_str[:10]
+    return any(start <= d <= end for start, end in _VACANCES_IDF)
 
 
 def _wmo_groupe(code) -> str:
@@ -518,7 +558,7 @@ def _classifier_alerte(texte: str) -> str:
 
 def _cat_jour(date_str, weekday: int) -> str:
     """Retourne la catégorie jour IDFM (DIJFP / SAHV / JOHV)."""
-    if isinstance(date_str, str) and date_str[:10] in _JOURS_FERIES or weekday == 6:
+    if est_jour_ferie(date_str) or weekday == 6:
         return "DIJFP"
     if weekday == 5:
         return "SAHV"
@@ -598,57 +638,6 @@ def _fetch_meteo_paris_horaire(dates: "list[str]") -> "dict[tuple, dict]":
 
     return result
 
-
-def _target_encode_terminus(df: pd.DataFrame) -> pd.DataFrame:
-    """Encode la colonne 'terminus' par le retard moyen observé (target encoding)."""
-    global_mean = df["retard_sec"].mean(skipna=True)
-    if pd.isna(global_mean):
-        global_mean = 0.0
-    terminus_clean = df["terminus"].fillna("_inconnu").str.strip().where(
-        df["terminus"].notna() & (df["terminus"].str.strip() != ""), other="_inconnu"
-    )
-    means = df.groupby(terminus_clean)["retard_sec"].mean()
-    df["terminus_encoded"] = terminus_clean.map(means).fillna(global_mean)
-    return df
-
-
-def _target_encode_station(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Encode stop_ref par le retard moyen observé à cet arrêt (target encoding).
-    Capture l'effet propre à chaque station indépendamment de la ligne.
-    Les arrêts sans retard observé reçoivent le retard moyen global.
-    """
-    global_mean = df["retard_sec"].mean(skipna=True)
-    if pd.isna(global_mean):
-        global_mean = 0.0
-    stop_clean = df["stop_ref"].fillna("_inconnu").astype(str).str.strip()
-    stop_clean = stop_clean.where(stop_clean != "", other="_inconnu")
-    means = df.groupby(stop_clean)["retard_sec"].mean()
-    df["station_encoded"] = stop_clean.map(means).fillna(global_mean)
-    
-    TargetEncoder()
-    return df
-
-def target_encode(df:pd.DataFrame,categorical_features:list,target:str) -> pd.DataFrame:
-    """_summary_
-
-    Args:
-        df (pd.DataFrame): _description_
-        categorical_features (list): _description_
-
-    Returns:
-        pd.DataFrame: _description_
-    """
-    te = TargetEncoder(categories='auto',target_type='continuous',cv=5,smooth='auto',random_state=42)
-    y = df[target]
-    X = df[categorical_features]
-    X_train,X_test,y_train,y_test = train_test_split(X,y,train_size=.80)
-    te.fit(X_train,y_train)
-    te.transform(X_train)
-    te.transform(X_test)
-    return df
-
-
 def _charger_referentiel_arrets() -> "dict[str, str]":
     """
     Retourne un dict {id_numerique: nom_arret} pour tous les arrêts IDFM.
@@ -696,20 +685,9 @@ def _charger_referentiel_arrets() -> "dict[str, str]":
 
 def build_features(csv_path: str = CSV_FILE) -> pd.DataFrame:
     """
-    Charge un CSV brut (schéma ancien ou courant) et calcule toutes les features.
+    Charge un CSV brut (schéma courant) et calcule toutes les features.
     Retourne un DataFrame avec les NaN encore présents (à imputer ensuite).
     """
-    with open(csv_path, "r", encoding="utf-8-sig", errors="replace") as _f:
-        _file_header = next(csv.reader(_f))
-
-    if _file_header != CSV_COLONNES:
-        raise ValueError(
-            f"Schéma CSV incompatible !\n"
-            f"  Header fichier ({len(_file_header)} cols) ≠ schéma courant ({len(CSV_COLONNES)} cols).\n"
-            f"  Fichier : {os.path.abspath(csv_path)}\n"
-            f"  Action  : supprimer ou remplacer le fichier, puis relancer la collecte."
-        )
-
     df = pd.read_csv(csv_path, low_memory=False)
 
     # 0. nom_ligne : remplir les valeurs vides/absentes via LIGNES_PAR_REF + GTFS
@@ -733,8 +711,9 @@ def build_features(csv_path: str = CSV_FILE) -> pd.DataFrame:
     df["_date_str"]  = ref_dt.dt.strftime("%Y-%m-%d")
     df["_heure_int"] = ref_dt.dt.hour
 
-    # 4. Jour férié
-    df["jour_ferie"] = df["_date_str"].isin(_JOURS_FERIES)
+    # 4. Jour férié et vacances scolaires IDF
+    df["jour_ferie"] = df["_date_str"].apply(est_jour_ferie)
+    df["vacances"]   = df["_date_str"].apply(est_vacances)
 
     # 5. Météo horaire Paris
     meteo_map = _fetch_meteo_paris_horaire(df["_date_str"].dropna().tolist())
@@ -758,10 +737,6 @@ def build_features(csv_path: str = CSV_FILE) -> pd.DataFrame:
 
     # 7. heure_tranche numérique (peut être string vide dans anciens CSV)
     df["heure_tranche"] = pd.to_numeric(df["heure_tranche"], errors="coerce").fillna(0).astype(int)
-
-    # 8. Target encoding du terminus et de la station (arrêt)
-    df = _target_encode_terminus(df)
-    df = _target_encode_station(df)
 
     # 9. Alertes réseau
     if "alerte_active" not in df.columns:
@@ -847,128 +822,7 @@ def impute_missing(df: pd.DataFrame) -> pd.DataFrame:
 
     return df
 
-
-# ══════════════════════════════════════════════════════════════
-# PARTIE 4 — ENCODAGE & PRÉPARATION ML
-# ══════════════════════════════════════════════════════════════
-
-# Mappings entiers fixes pour chaque colonne catégorielle.
-# Déterministes : le même code sera assigné indépendamment du dataset traité.
-# Valeur inconnue → -1 (jamais vu à l'entraînement mais géré par les modèles).
-CAT_ENCODINGS: dict[str, dict[str, int]] = {
-    "nom_ligne": {
-        nom: i for i, nom in enumerate(["_inconnu"] + sorted(LIGNES.keys()))
-    },
-    "jour_semaine": {j: i for i, j in enumerate(JOURS)},
-    "periode_journee": {
-        "Nuit": 0, "Pointe matin": 1, "Creuse matin": 2, "Méridienne": 3,
-        "Creuse après-midi": 4, "Pointe soir": 5, "Soirée": 6,
-    },
-    "meteo_groupe": {
-        "ensoleille": 0, "nuageux": 1, "brouillard": 2, "pluie": 3,
-        "neige": 4, "averses": 5, "orage": 6, "autre": 7, "inconnu": 8,
-    },
-    "categorie_alerte": {
-        "aucune": 0, "greve": 1, "incident": 2, "travaux": 3,
-        "meteo": 4, "retard": 5, "voyageur": 6, "autre": 7,
-    },
-}
-
-# Colonnes du CSV ML-ready (dans l'ordre final)
-ML_COLONNES = [
-    # Target
-    "retard_sec",
-    # Numériques
-    "direction_ref", "terminus_encoded", "station_encoded", "heure_tranche", "mois",
-    "jour_ferie", "precipitation", "snowfall", "wind_speed", "temperature", "occupation",
-    # Catégorielles encodées (int)
-    "nom_ligne", "jour_semaine", "periode_journee", "meteo_groupe", "categorie_alerte",
-]
-
-
-def encoder_categoriques(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Encode les colonnes catégorielles avec les mappings fixes de CAT_ENCODINGS.
-    Valeurs inconnues/vides → -1.
-    Booléens (jour_ferie, alerte_active) → 0 / 1.
-    """
-    df = df.copy()
-    for col, mapping in CAT_ENCODINGS.items():
-        if col not in df.columns:
-            continue
-        serie = df[col].fillna("_inconnu").astype(str).str.strip()
-        serie = serie.where(serie != "", other="_inconnu")
-        df[col] = serie.map(mapping).fillna(-1).astype(int)
-
-    for col in ("jour_ferie", "alerte_active"):
-        if col in df.columns:
-            df[col] = (
-                df[col]
-                .map({True: 1, False: 0, "True": 1, "False": 0, 1: 1, 0: 0})
-                .fillna(0)
-                .astype(int)
-            )
-    return df
-
-
-def preparer_ml(
-    csv_path: str = CSV_FILE,
-    output_path: str | None = None,
-) -> pd.DataFrame:
-    """
-    Pipeline complet CSV brut → DataFrame ML-ready.
-
-    Étapes :
-      1. build_features()    : calcule retard_sec, météo, occupation, terminus_encoded…
-      2. impute_missing()    : comble les NaN
-      3. encoder_categoriques() : catégorielles → entiers fixes
-      4. Sélection de ML_COLONNES uniquement
-      5. Conversion numérique stricte de toutes les colonnes
-      6. Sauvegarde si output_path fourni
-
-    Gère les CSV ancienne et nouvelle génération (schéma 18 ou 19 colonnes).
-    Les lignes sans retard_sec calculable (horaires manquants) sont conservées
-    pour permettre l'inférence ; prediction.py les filtre pour l'entraînement.
-
-    Retourne le DataFrame ML-ready.
-    """
-    log.info(f"  Feature engineering sur : {csv_path}")
-    df = build_features(csv_path)
-    log.info(f"  {len(df):,} lignes chargées — imputation NaN…")
-    df = impute_missing(df)
-    log.info("  Encodage des variables catégorielles…")
-    df = encoder_categoriques(df)
-
-    # Sélectionner uniquement les colonnes ML (dans l'ordre défini)
-    cols_presentes = [c for c in ML_COLONNES if c in df.columns]
-    cols_manquantes = [c for c in ML_COLONNES if c not in df.columns]
-    if cols_manquantes:
-        log.warning(f"  Colonnes absentes (mises à 0) : {cols_manquantes}")
-        for c in cols_manquantes:
-            df[c] = 0
-    df = df[ML_COLONNES].copy()
-
-    # Conversion numérique stricte : tout devient float (NaN résiduels → 0 sauf retard_sec)
-    for col in ML_COLONNES:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-    for col in [c for c in ML_COLONNES if c != "retard_sec"]:
-        df[col] = df[col].fillna(0.0)
-
-    nan_retard = df["retard_sec"].isna().sum()
-    if nan_retard:
-        log.info(f"  retard_sec NaN : {nan_retard:,} lignes (conservées pour l'inférence)")
-
-    log.info(f"  Dataset ML-ready : {len(df):,} lignes × {len(df.columns)} colonnes")
-
-    if output_path:
-        os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
-        df.to_csv(output_path, index=False, encoding="utf-8-sig")
-        log.info(f"  CSV ML-ready exporté → {output_path}")
-
-    return df
-
-
-def collecter_snapshot_ml() -> pd.DataFrame:
+def collecter_snapshot_ml():
     """
     Appel API unique → produit les 2 fichiers du projet :
       Fichier 1 (sans transformation) → CSV_FILE  (passages_tglobal.csv)
@@ -997,13 +851,7 @@ def collecter_snapshot_ml() -> pd.DataFrame:
         writer.writeheader()
         writer.writerows(rows)
 
-    try:
-        df = preparer_ml(_tmp, output_path=CSV_FILE_ML)
-    finally:
-        os.unlink(_tmp)
-
-    log.info(f"  Fichier 2 (avec transformation)  → {os.path.abspath(CSV_FILE_ML)}")
-    return df
+    return 
 
 
 # ─────────────────────────────────────────────
@@ -1029,9 +877,6 @@ def main():
     parser = argparse.ArgumentParser(description="Construction du dataset PRIM IDFM")
     parser.add_argument("--collecter",  action="store_true",
                         help="Collecte API continue → fichier 1 (CSV brut, sans transformation)")
-    parser.add_argument("--construire", action="store_true",
-                        help="Produit les 2 fichiers : brut + ML-ready. "
-                             "Sans --csv : appelle l'API d'abord.")
     parser.add_argument("--csv",   default=None, metavar="PATH",
                         help="CSV brut source pour --construire (défaut : appel API)")
     parser.add_argument("--duree", type=float, default=None, metavar="HEURES",
@@ -1051,32 +896,6 @@ def main():
         log.info(msg)
         collecter_en_continu(duree_heures=args.duree,csv_file = csv_collecte)
 
-    if args.construire:
-        log.info("=" * 55)
-        log.info("  CONSTRUCTION DES 2 FICHIERS")
-        log.info("=" * 55)
-
-        if args.csv:
-            # Fichier 1 fourni → on génère uniquement le fichier 2
-            csv_brut = args.csv
-            CSV_DISPONIBLE = csv_brut
-            log.info(f"  Fichier 1 (sans transformation) → {os.path.abspath(csv_brut)}")
-            df_ml = preparer_ml(csv_brut, output_path=CSV_FILE_ML)
-            log.info(f"  Fichier 2 (avec transformation)  → {os.path.abspath(CSV_FILE_ML)}")
-        else:
-            # Pas de CSV → appel API → fichier 1 + fichier 2
-            log.info("  Appel API PRIM — collecte des passages…")
-            rows = get_estimated_timetable()
-            if not rows:
-                log.error("  Aucune donnée retournée par l'API.")
-                return
-            ecrire_csv(rows, CSV_FILE)
-            log.info(f"  Fichier 1 (sans transformation) → {os.path.abspath(CSV_FILE)}")
-            df_ml = preparer_ml(CSV_FILE, output_path=CSV_FILE_ML)
-            log.info(f"  Fichier 2 (avec transformation)  → {os.path.abspath(CSV_FILE_ML)}")
-
-        log.info(f"  {len(df_ml):,} lignes × {len(df_ml.columns)} colonnes dans le fichier 2")
-
-
+   
 if __name__ == "__main__":
     main()

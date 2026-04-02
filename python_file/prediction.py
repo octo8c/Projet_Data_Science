@@ -28,6 +28,7 @@ from build_dataset import preparer_ml, collecter_snapshot_ml, ML_COLONNES
 
 import numpy as np
 import pandas as pd
+from sklearn.compose import ColumnTransformer
 from sklearn.linear_model import LinearRegression, Ridge, LogisticRegression
 from sklearn.tree import DecisionTreeRegressor, DecisionTreeClassifier
 from sklearn.svm import SVC
@@ -36,7 +37,14 @@ from sklearn.ensemble import (
     GradientBoostingRegressor, HistGradientBoostingRegressor,
     RandomForestClassifier, GradientBoostingClassifier, HistGradientBoostingClassifier,
 )
+from sklearn.metrics import (
+    accuracy_score, f1_score, precision_score, recall_score, roc_auc_score,
+    confusion_matrix,
+)
+from sklearn.model_selection import cross_val_score, cross_val_predict, cross_validate, StratifiedKFold
 from sklearn.neighbors import KNeighborsRegressor, KNeighborsClassifier
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import TargetEncoder
 
 warnings.filterwarnings("ignore")
 
@@ -44,14 +52,31 @@ warnings.filterwarnings("ignore")
 # CONFIGURATION
 # ─────────────────────────────────────────────
 
-TARGET       = "retard_sec"
-FEATURES_CAT = ["nom_ligne", "jour_semaine", "periode_journee", "meteo_groupe", "categorie_alerte","stations"]
+TARGET = "retard_sec"
+
+# Colonnes pour KFold target encoding (traitées dans evaluer_*(), pas ici)
+FEATURES_CAT_TARGET = ["nom_ligne", "terminus", "stop_ref"]
+
+# Features numériques + OHE disponibles directement après transformer_dataset()
 FEATURES_NUM = [
-    "heure_tranche", "mois", "jour_ferie", "occupation",
-    "direction_ref", "terminus_encoded", "station_encoded",
+    # Numériques brutes
+    "mois", "jour_ferie", "vacances", "occupation",
+    "terminus_encoded", "station_encoded", "alerte_active",
     "precipitation", "snowfall", "wind_speed", "temperature",
+    # OHE periode_journee
+    "periode_Nuit", "periode_Pointe matin", "periode_Creuse matin",
+    "periode_Méridienne", "periode_Creuse après-midi", "periode_Pointe soir", "periode_Soirée",
+    # OHE categorie_alerte
+    "alerte_aucune", "alerte_greve", "alerte_incident", "alerte_travaux",
+    "alerte_meteo", "alerte_retard", "alerte_voyageur", "alerte_autre",
+    # OHE jour_semaine
+    "jour_Lundi", "jour_Mardi", "jour_Mercredi", "jour_Jeudi",
+    "jour_Vendredi", "jour_Samedi", "jour_Dimanche",
+    # OHE meteo_groupe
+    "meteo_ensoleille", "meteo_nuageux", "meteo_brouillard", "meteo_pluie",
+    "meteo_neige", "meteo_averses", "meteo_orage", "meteo_autre", "meteo_inconnu",
 ]
-FEATURES = FEATURES_CAT + FEATURES_NUM
+FEATURES = FEATURES_NUM  # FEATURES_CAT_TARGET ajoutés via KFold target encoding dans evaluer_*
 
 N_FOLDS        = 5
 RANDOM_STATE   = 42
@@ -156,48 +181,31 @@ PARAM_GRIDS_CLASSIFICATION: dict[str, dict] = {
 # ─────────────────────────────────────────────
 
 def charger(csv_path: str) -> pd.DataFrame:
-    """Charge un CSV ML-ready. Si brut, appelle preparer_ml() à la volée."""
-    import csv as _csv_mod
+    """Charge un CSV brut PRIM directement.
 
-    with open(csv_path, "r", encoding="utf-8-sig", errors="replace") as _f:
-        header = next(_csv_mod.reader(_f))
-
-    if set(ML_COLONNES).issubset(set(header)):
-        df = pd.read_csv(csv_path, low_memory=False)
-    else:
-        print(f"  CSV brut détecté ({len(header)} cols) — application du pipeline ML…")
-        df = preparer_ml(csv_path)
-
+    transformer_dataset() appelé ensuite dans main() se charge de toutes
+    les transformations (suppression data leakage, OHE, encodage cyclique…).
+    """
+    df = pd.read_csv(csv_path, encoding="utf-8-sig", low_memory=False)
     df[TARGET] = pd.to_numeric(df[TARGET], errors="coerce")
     avant = len(df)
     df = df.dropna(subset=[TARGET]).reset_index(drop=True)
-    print(f"  Lignes conservées (retard_sec calculable) : {len(df):,} / {avant:,}")
-
-    for col in FEATURES:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
-        else:
-            df[col] = 0.0
-
+    print(f"  {csv_path} — {len(df):,} lignes avec retard_sec / {avant:,} total")
     return df
 
 
 def _charger_api() -> pd.DataFrame:
-    """Snapshot API temps réel → DataFrame ML-ready."""
+    """Snapshot API temps réel → DataFrame brut (même format que CSV brut PRIM)."""
+    from build_dataset import get_estimated_timetable, CSV_COLONNES
     print("  Mode API temps réel (snapshot unique)")
-    df = collecter_snapshot_ml()
-
+    rows = get_estimated_timetable()
+    if not rows:
+        raise ValueError("L'API PRIM n'a retourné aucune donnée.")
+    df = pd.DataFrame(rows, columns=CSV_COLONNES)
     df[TARGET] = pd.to_numeric(df[TARGET], errors="coerce")
     avant = len(df)
     df = df.dropna(subset=[TARGET]).reset_index(drop=True)
     print(f"  Lignes avec retard calculable : {len(df):,} / {avant:,}")
-
-    for col in FEATURES:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
-        else:
-            df[col] = 0.0
-
     return df
 
 
@@ -218,8 +226,98 @@ def _maj_cache(path: str, nom: str, params: dict) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(cache, f, indent=2, ensure_ascii=False)
+        
+# ________________________________________________
+# Preprocessing du dataset
+# ________________________________________________
 
+def transformer_dataset(df: pd.DataFrame) -> pd.DataFrame:
+    """Transforme un DataFrame brut PRIM en features ML-ready avec sklearn.
 
+    Après cette fonction, nom_ligne, terminus et direction_ref restent en string :
+    ils seront encodés via KFold target encoding dans evaluer_*() pour éviter
+    tout data leakage.
+
+    Transformations :
+      1. Suppression des colonnes de data leakage (horaires prévus/estimés, identifiants)
+      2. alerte_active, jour_ferie  : booléen → 0/1 (LabelBinarizer)
+      4. periode_journee  → OneHotEncoder sklearn (7 colonnes)
+      5. categorie_alerte → OneHotEncoder sklearn (8 colonnes)
+      6. jour_semaine     → OneHotEncoder sklearn (7 colonnes)
+      7. meteo_groupe     → OneHotEncoder sklearn (9 colonnes)
+      8. Colonnes numériques restantes → float (NaN → 0)
+    """
+    from sklearn.preprocessing import OneHotEncoder, LabelBinarizer
+    from sklearn.preprocessing import FunctionTransformer
+
+    df = df.copy()
+
+    # ── 1. Suppression data leakage + identifiants ────────────────────────────
+    df = df.drop(columns=[c for c in [
+        "horaire_arrivee_prevu", "horaire_depart_prevu",
+        "horaire_arrivee_estime", "horaire_depart_estime",
+        "arrivee_prevue_hhmm", "depart_prevu_hhmm", "depart_estime_hhmm",
+        "date_capture", "line_ref", "operateur", "stop_ref", "nom_arret",
+    ] if c in df.columns])
+
+    # ── 2. Booléens → 0/1 via LabelBinarizer ─────────────────────────────────
+    for col in ("alerte_active", "jour_ferie", "vacances"):
+        if col in df.columns:
+            lb = LabelBinarizer()
+            vals = df[col].map({True: "1", False: "0", "True": "1", "False": "0",
+                                1: "1", 0: "0"}).fillna("0")
+            df[col] = np.asarray(lb.fit_transform(vals)).ravel().astype(int)
+
+    # ── Helper OHE sklearn ────────────────────────────────────────────────────
+    def _ohe_sklearn(df: pd.DataFrame, col: str, prefix: str,
+                     categories: list[str]) -> pd.DataFrame:
+        enc = OneHotEncoder(
+            categories=[categories],
+            sparse_output=False,
+            handle_unknown="ignore",
+            dtype=np.int8,
+        )
+        col_data = df[[col]].fillna(categories[0]).astype(str)
+        arr = enc.fit_transform(col_data)
+        col_names = [f"{prefix}_{cat}" for cat in categories]
+        dummies = pd.DataFrame(arr, columns=col_names, index=df.index)
+        return pd.concat([df.drop(columns=[col]), dummies], axis=1)
+
+    # ── 4. OHE periode_journee ────────────────────────────────────────────────
+    if "periode_journee" in df.columns and df["periode_journee"].dtype == object:
+        df = _ohe_sklearn(df, "periode_journee", "periode", [
+            "Nuit", "Pointe matin", "Creuse matin", "Méridienne",
+            "Creuse après-midi", "Pointe soir", "Soirée",
+        ])
+
+    # ── 5. OHE categorie_alerte ───────────────────────────────────────────────
+    if "categorie_alerte" in df.columns and df["categorie_alerte"].dtype == object:
+        df = _ohe_sklearn(df, "categorie_alerte", "alerte", [
+            "aucune", "greve", "incident", "travaux",
+            "meteo", "retard", "voyageur", "autre",
+        ])
+
+    # ── 6. OHE jour_semaine ───────────────────────────────────────────────────
+    if "jour_semaine" in df.columns and df["jour_semaine"].dtype == object:
+        df = _ohe_sklearn(df, "jour_semaine", "jour", [
+            "Lundi", "Mardi", "Mercredi", "Jeudi", "Vendredi", "Samedi", "Dimanche",
+        ])
+
+    # ── 7. OHE meteo_groupe ───────────────────────────────────────────────────
+    if "meteo_groupe" in df.columns and df["meteo_groupe"].dtype == object:
+        df = _ohe_sklearn(df, "meteo_groupe", "meteo", [
+            "ensoleille", "nuageux", "brouillard", "pluie",
+            "neige", "averses", "orage", "autre", "inconnu",
+        ])
+
+    # ── 8. Numériques → float ─────────────────────────────────────────────────
+    for col in ("mois", "occupation", "terminus_encoded", "station_encoded",
+                "precipitation", "snowfall", "wind_speed", "temperature"):
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
+
+    # nom_ligne, terminus, direction_ref restent en string → KFold target encoding
+    return df
 # ─────────────────────────────────────────────
 # WORKER RÉGRESSION
 # ─────────────────────────────────────────────
@@ -464,88 +562,63 @@ async def evaluer_regression(df: pd.DataFrame, label: str) -> pd.DataFrame:
 
 async def evaluer_classification(df: pd.DataFrame, label: str) -> tuple[pd.DataFrame, dict, dict]:
     """
-    Retourne (DataFrame résultats, dict {nom_modèle: (_fpr, _tpr)})
-    pour les courbes ROC.
+    Retourne (DataFrame résultats, dict vide pour roc_data, dict {nom: confusion_matrix})
     """
-    cols = [c for c in FEATURES if c in df.columns]
-    X    = df[cols].values.astype(float)
-    y    = (df[TARGET] >= SEUIL_RETARD).to_numpy(dtype=int)
+    from sklearn.impute import SimpleImputer
+
+    cols_cat = [c for c in FEATURES_CAT_TARGET if c in df.columns]
+    cols_num = [c for c in FEATURES_NUM        if c in df.columns]
+    X = df[cols_cat + cols_num]
+    y = (df[TARGET] >= SEUIL_RETARD).to_numpy(dtype=int)
 
     n_pos = y.sum()
     n_neg = len(y) - n_pos
     print(f"  Classe 0 (à l'heure) : {n_neg:,}  |  Classe 1 (retard >{SEUIL_RETARD}s) : {n_pos:,}")
-    print(f"  Évaluation : StratifiedKFold k={N_FOLDS}  ({len(X):,} lignes)")
-    print(f"  Lancement de {len(MODELES_CLASSIFICATION)} modèles en parallèle…\n")
+    print(f"  Évaluation : StratifiedKFold k={N_FOLDS}  ({len(X):,} lignes)\n")
 
-    cache = _lire_cache(_CACHE_CLASSIFICATION)
-    loop  = asyncio.get_event_loop()
-
-    SVC_MAX_SAMPLES = 10_000
-    if len(X) > SVC_MAX_SAMPLES:
-        rng = np.random.default_rng(42)
-        svc_idx = rng.choice(len(X), size=SVC_MAX_SAMPLES, replace=False)
-        X_svc, y_svc = X[svc_idx], y[svc_idx]
-        print(f"  SVC limité à {SVC_MAX_SAMPLES:,} lignes tirées au hasard (dataset trop grand)")
-    else:
-        X_svc, y_svc = X, y
-
-    executor = ProcessPoolExecutor()
-    futures = {
-        loop.run_in_executor(
-            executor,
-            _train_eval_classification,
-            nom, modele,
-            PARAM_GRIDS_CLASSIFICATION.get(nom, {}),
-            cache.get(nom),
-            X_svc if nom == "SVC" else X,
-            y_svc if nom == "SVC" else y,
-            N_FOLDS,
-        ): nom
-        for nom, modele in MODELES_CLASSIFICATION.items()
-    }
-
+    skf = StratifiedKFold(n_splits=N_FOLDS, shuffle=True, random_state=RANDOM_STATE)
     lignes: list[dict] = []
-    roc_data: dict[str, tuple] = {}
-    cm_data:  dict[str, list]  = {}
+    cm_data: dict[str, list] = {}
 
-    for future in asyncio.as_completed(futures):
-        m = await future
-        lignes.append(m)
+    for nom, modele in MODELES_CLASSIFICATION.items():
+        pipeline = Pipeline([
+            ("encoder", ColumnTransformer([
+                ("cat", Pipeline([
+                    ("imputer", SimpleImputer(strategy="constant", fill_value="inconnu")),
+                    ("te",      TargetEncoder(smooth="auto", target_type="binary", random_state=RANDOM_STATE)),
+                ]), cols_cat),
+                ("num", "passthrough", cols_num),
+            ])),
+            ("model", modele),
+        ])
 
-        if m["_gs_run"] and m["_params_raw"]:
-            _maj_cache(_CACHE_CLASSIFICATION, m["Modèle"], m["_params_raw"])
-            print(f"  [GridSearch OK] {m['Modèle']:<25} → {m['_params_raw']}")
-        elif m["_params_raw"]:
-            print(f"  [Cache utilisé] {m['Modèle']:<25} → {m['_params_raw']}")
+        auc_scores = cross_val_score(pipeline, X, y, cv=skf, scoring="roc_auc", n_jobs=1)
+        y_pred     = cross_val_predict(pipeline, X, y, cv=skf, method="predict", n_jobs=1)
+
+        cm = confusion_matrix(y, y_pred).tolist()
+        cm_data[nom] = cm
+        tn, fp, fn, tp = cm[0][0], cm[0][1], cm[1][0], cm[1][1]
 
         print(
-            f"  [Terminé ✓]     {m['Modèle']:<25}"
-            f"  AUC={m['AUC']:.3f}±{m['AUC ±']:.3f}"
-            f"  F1={m['F1']:.3f}±{m['F1 ±']:.3f}"
-            f"  Acc={m['Accuracy']:.3f}±{m['Accuracy ±']:.3f}\n"
+            f"  [Terminé ✓] {nom:<25}"
+            f"  AUC={auc_scores.mean():.3f}±{auc_scores.std():.3f}"
+            f"  Acc={( tn + tp) / (tn + fp + fn + tp):.3f}"
         )
+        print(f"    Matrice de confusion (agrégée) :")
+        print(f"      TN={tn:,}  FP={fp:,}")
+        print(f"      FN={fn:,}  TP={tp:,}\n")
 
-        # Afficher la matrice de confusion dans le terminal
-        cm = m["_confusion_matrix"]
-        if len(cm) == 2:
-            tn, fp, fn, tp = cm[0][0], cm[0][1], cm[1][0], cm[1][1]
-            print(f"    Matrice de confusion (agrégée) :")
-            print(f"      TN={tn:,}  FP={fp:,}")
-            print(f"      FN={fn:,}  TP={tp:,}\n")
+        lignes.append({
+            "Modèle":    nom,
+            "AUC":       float(auc_scores.mean()),
+            "AUC ±":     float(auc_scores.std()),
+            "Accuracy":  float((tn + tp) / (tn + fp + fn + tp)),
+            "F1":        float(f1_score(y, y_pred, zero_division=0)),
+            "Précision": float(precision_score(y, y_pred, zero_division=0)),
+            "Rappel":    float(recall_score(y, y_pred, zero_division=0)),
+        })
 
-        roc_data[m["Modèle"]] = (m["_fpr"], m["_tpr"])
-        cm_data[m["Modèle"]]  = m["_confusion_matrix"]
-
-    executor.shutdown(wait=False)
-
-    for m in lignes:
-        m.pop("_params_raw",      None)
-        m.pop("_gs_run",          None)
-        m.pop("_confusion_matrix",None)
-        m.pop("_fpr",             None)
-        m.pop("_tpr",             None)
-
-    return pd.DataFrame(lignes), roc_data, cm_data
+    return pd.DataFrame(lignes), {}, cm_data
 
 
 # ─────────────────────────────────────────────
@@ -646,6 +719,7 @@ async def main():
     if len(df) < N_FOLDS * 2:
         print(f"  Pas assez de données ({len(df)} lignes). Abandon.")
         return
+    df = transformer_dataset(df)
 
     from datetime import datetime
     from rapport import ecrire_rapport_regression, ecrire_rapport_classification
