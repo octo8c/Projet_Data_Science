@@ -383,3 +383,73 @@ def impute_missing(df: pd.DataFrame) -> pd.DataFrame:
         df[["occupation"]] = SimpleImputer(strategy="mean").fit_transform(df[["occupation"]])
 
     return df
+
+#------
+
+def ajouter_score_global_regression(
+    resultats: pd.DataFrame,
+    proche_col: str,
+) -> pd.DataFrame:
+    """
+    Ajoute un score global pondéré de régression dans [0, 1].
+    Plus le score est élevé, meilleur est le modèle.
+
+    Métriques utilisées :
+      - R²              (↑ mieux)
+      - RMSE (s)        (↓ mieux)
+      - MAE (s)         (↓ mieux)
+      - Proche≤Xs (%)   (↑ mieux)
+      - MAPE (%)        (↓ mieux)
+
+    Pondérations :
+      - R²            : 0.35
+      - RMSE (s)      : 0.25
+      - MAE (s)       : 0.20
+      - Proche≤Xs (%) : 0.15
+      - MAPE (%)      : 0.05
+    """
+    df = resultats.copy()
+
+    poids = {
+        "R²": 0.35,
+        "RMSE (s)": 0.25,
+        "MAE (s)": 0.20,
+        proche_col: 0.15,
+        "MAPE (%)": 0.05,
+    }
+
+    def normaliser_positif(s: pd.Series) -> pd.Series:
+        # Plus grand = mieux
+        s = pd.to_numeric(s, errors="coerce")
+        s_min, s_max = s.min(), s.max()
+        if pd.isna(s_min) or pd.isna(s_max):
+            return pd.Series(0.0, index=s.index)
+        if s_max == s_min:
+            return pd.Series(1.0, index=s.index)
+        return (s - s_min) / (s_max - s_min)
+
+    def normaliser_negatif(s: pd.Series) -> pd.Series:
+        # Plus petit = mieux
+        s = pd.to_numeric(s, errors="coerce")
+        s_min, s_max = s.min(), s.max()
+        if pd.isna(s_min) or pd.isna(s_max):
+            return pd.Series(0.0, index=s.index)
+        if s_max == s_min:
+            return pd.Series(1.0, index=s.index)
+        return (s_max - s) / (s_max - s_min)
+
+    df["_score_R2"] = normaliser_positif(df["R²"])
+    df["_score_RMSE"] = normaliser_negatif(df["RMSE (s)"])
+    df["_score_MAE"] = normaliser_negatif(df["MAE (s)"])
+    df["_score_Proche"] = normaliser_positif(df[proche_col])
+    df["_score_MAPE"] = normaliser_negatif(df["MAPE (%)"])
+
+    df["Score global"] = (
+        poids["R²"] * df["_score_R2"]
+        + poids["RMSE (s)"] * df["_score_RMSE"]
+        + poids["MAE (s)"] * df["_score_MAE"]
+        + poids[proche_col] * df["_score_Proche"]
+        + poids["MAPE (%)"] * df["_score_MAPE"]
+    )
+
+    return df

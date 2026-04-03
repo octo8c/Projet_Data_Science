@@ -101,7 +101,7 @@ def ecrire_rapport_regression(
 ) -> str:
     """Génère rapport_regression_<horodatage>.md. Retourne le chemin."""
     proche_col = f"Proche≤{seuil_proche}s (%)"
-    best       = resultats.sort_values("R²", ascending=False).iloc[0]
+    best = resultats.sort_values("Score global", ascending=False).iloc[0]
 
     lignes = _entete(
         "Rapport — Comparaison des modèles de régression IDFM",
@@ -109,20 +109,31 @@ def ecrire_rapport_regression(
         cv_methode="KFold", scoring="r²",
     )
 
-    lignes += ["## Features utilisées\n", _feat_block(features) + "\n",
-               "### Détail des features\n"]
+    lignes += [
+        "## Features utilisées\n",
+        _feat_block(features) + "\n",
+        "### Détail des features\n",
+    ]
     lignes += _feat_table(features)
-    lignes += ["", "---\n",
-               "## Classements par métrique\n",
-               f"> Métriques calculées par KFold k={n_folds}. Format : **moyenne ± écart-type**.\n"]
+    lignes += [
+        "",
+        "---\n",
+        "## Classements par métrique\n",
+        f"> Métriques calculées par KFold k={n_folds}. Format : **moyenne ± écart-type**.\n",
+        f"> Le **score global** est un score pondéré défini comme suit : "
+        f"`0.35×R² + 0.25×RMSE_norm_inverse + 0.20×MAE_norm_inverse + "
+        f"0.15×Proche≤{seuil_proche}s_norm + 0.05×MAPE_norm_inverse`.\n",
+    ]
 
     configs = [
-        ("R²",       False, "R² — variance expliquée",              "↑ mieux"),
-        ("MAE (s)",  True,  "MAE (s) — erreur moyenne absolue",     "↓ mieux"),
-        ("RMSE (s)", True,  "RMSE (s) — pénalise les grandes erreurs", "↓ mieux"),
-        ("MAPE (%)", True,  "MAPE (%) — erreur relative",           "↓ mieux"),
-        (proche_col, False, f"Proche≤{seuil_proche}s — % prédictions proches", "↑ mieux"),
+        ("Score global", False, "Score global pondéré", "↑ mieux"),
+        ("R²",           False, "R² — variance expliquée", "↑ mieux"),
+        ("MAE (s)",      True,  "MAE (s) — erreur moyenne absolue", "↓ mieux"),
+        ("RMSE (s)",     True,  "RMSE (s) — pénalise les grandes erreurs", "↓ mieux"),
+        ("MAPE (%)",     True,  "MAPE (%) — erreur relative", "↓ mieux"),
+        (proche_col,     False, f"Proche≤{seuil_proche}s — % prédictions proches", "↑ mieux"),
     ]
+
     for col, ascending, titre, sens in configs:
         tri = resultats.sort_values(col, ascending=ascending).reset_index(drop=True)
         lignes.append(f"### {titre} ({sens})\n")
@@ -137,10 +148,11 @@ def ecrire_rapport_regression(
 
     lignes += [
         "---\n",
-        "## Meilleur modèle global (R² moyen)\n",
+        "## Meilleur modèle global (Score global)\n",
         f"**[{best['Dataset']}] {best['Modèle']}**\n",
         "| Métrique | Moyenne | Écart-type |",
         "|----------|--------:|----------:|",
+        f"| Score global | `{best['Score global']:.4f}` | — |",
         f"| R²       | `{best['R²']:.4f}` | `{best.get('R² ±', float('nan')):.4f}` |",
         f"| MAE (s)  | `{best['MAE (s)']:.1f}` | `{best.get('MAE (s) ±', float('nan')):.1f}` |",
         f"| RMSE (s) | `{best['RMSE (s)']:.1f}` | `{best.get('RMSE (s) ±', float('nan')):.1f}` |",
@@ -151,6 +163,7 @@ def ecrire_rapport_regression(
         "## Glossaire\n",
         "| Métrique | Description |",
         "|----------|-------------|",
+        "| **Score global** | Score pondéré entre 0 et 1 combinant R², RMSE, MAE, MAPE et % de prédictions proches. Plus il est élevé, meilleur est le compromis global. |",
         "| **R²** | Part de variance expliquée. 1 = parfait, 0 = équivalent à prédire la moyenne. |",
         "| **MAE** | Erreur absolue moyenne en secondes. |",
         "| **RMSE** | Comme MAE mais les grandes erreurs sont amplifiées. |",
@@ -204,26 +217,14 @@ def ecrire_rapport_classification(
         f"![Courbes ROC]({roc_png})\n",
         f"> Chaque courbe est la moyenne des {n_folds} folds (StratifiedKFold).\n",
         "---\n",
-        "## Matrices de confusion\n",
-        f"> Matrices agrégées sur les {n_folds} folds StratifiedKFold (somme de toutes les prédictions).\n",
-    ]
-    for png in cm_pngs:
-        nom = png.replace(f"confusion_", "").replace(f"_{horodatage}.png", "").replace("_", " ").title()
-        lignes.append(f"\n### {nom}\n")
-        lignes.append(f"![Matrice de confusion {nom}]({png})\n")
-    lignes += [
-        "---\n",
-        "## Classements par métrique\n",
-        f"> Métriques calculées par StratifiedKFold k={n_folds}. Format : **moyenne ± écart-type**.\n",
+        "## Classement par métrique\n",
+        f"> Métrique calculée par StratifiedKFold k={n_folds}. Format : **moyenne ± écart-type**.\n",
     ]
 
     configs = [
-        ("AUC",       False, "AUC-ROC",                    "↑ mieux"),
-        ("F1",        False, "F1-score (seuil 0.5)",       "↑ mieux"),
-        ("Accuracy",  False, "Accuracy",                   "↑ mieux"),
-        ("Précision", False, "Précision",                  "↑ mieux"),
-        ("Rappel",    False, "Rappel",                     "↑ mieux"),
+        ("AUC", False, "AUC-ROC", "↑ mieux"),
     ]
+
     for col, ascending, titre, sens in configs:
         tri = resultats.sort_values(col, ascending=ascending).reset_index(drop=True)
         lignes.append(f"### {titre} ({sens})\n")
@@ -243,20 +244,12 @@ def ecrire_rapport_classification(
         "| Métrique | Moyenne | Écart-type |",
         "|----------|--------:|----------:|",
         f"| AUC      | `{best['AUC']:.4f}` | `{best.get('AUC ±', float('nan')):.4f}` |",
-        f"| F1       | `{best['F1']:.4f}` | `{best.get('F1 ±', float('nan')):.4f}` |",
-        f"| Accuracy | `{best['Accuracy']:.4f}` | `{best.get('Accuracy ±', float('nan')):.4f}` |",
-        f"| Précision | `{best['Précision']:.4f}` | `{best.get('Précision ±', float('nan')):.4f}` |",
-        f"| Rappel   | `{best['Rappel']:.4f}` | `{best.get('Rappel ±', float('nan')):.4f}` |",
         f"| Params   | `{best['Meilleurs params']}` | — |\n",
         "---\n",
         "## Glossaire\n",
         "| Métrique | Description |",
         "|----------|-------------|",
         "| **AUC-ROC** | Aire sous la courbe ROC. 1 = parfait, 0.5 = aléatoire. |",
-        "| **F1** | Moyenne harmonique précision/rappel. Utile si les classes sont déséquilibrées. |",
-        "| **Accuracy** | % de prédictions correctes toutes classes confondues. |",
-        "| **Précision** | Parmi les trains prédits en retard, combien le sont vraiment. |",
-        "| **Rappel** | Parmi les trains réellement en retard, combien sont détectés. |",
         f"| **StratifiedKFold k={n_folds}** | Validation croisée stratifiée : conserve la proportion de chaque classe dans chaque fold. |",
         f"| **Seuil retard** | Un train est considéré en retard si `retard_sec > {seuil_retard}` (>{seuil_retard // 60} min). |",
     ]

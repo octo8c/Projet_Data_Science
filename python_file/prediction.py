@@ -68,7 +68,7 @@ MODELES_REGRESSION = {
 
 MODELES_CLASSIFICATION = {
     "LogisticRegression":   LogisticRegression(max_iter=1000),
-    #"SVC":                  SVC(probability=True, random_state=tl.RANDOM_STATE),
+    "SVC":                  SVC(probability=False, random_state=tl.RANDOM_STATE, max_iter= 2000),
     "DecisionTree":         DecisionTreeClassifier(random_state=tl.RANDOM_STATE),
     "RandomForest":         RandomForestClassifier(random_state=tl.RANDOM_STATE, n_jobs=1),
     "GradientBoosting":     GradientBoostingClassifier(random_state=tl.RANDOM_STATE),
@@ -382,7 +382,7 @@ async def evaluer_classification(df: pd.DataFrame, label: str) -> tuple[pd.DataF
     cache = _lire_cache(_CACHE_CLASSIFICATION)
     loop  = asyncio.get_event_loop()
 
-    SVC_MAX_SAMPLES = 10_000
+    SVC_MAX_SAMPLES = 3_000
     if len(X) > SVC_MAX_SAMPLES:
         rng = np.random.default_rng(42)
         svc_idx = rng.choice(len(X), size=SVC_MAX_SAMPLES, replace=False)
@@ -552,6 +552,7 @@ async def main():
     res_reg = await evaluer_regression(df, "ML-ready")
 
     proche_col = f"Proche≤{tl.SEUIL_PROCHE_S}s (%)"
+    res_reg = tl.ajouter_score_global_regression(res_reg, proche_col)
     _afficher_classements_regression(res_reg, proche_col)
 
     out_csv_reg = os.path.join(_DOSSIER, f"resultats_regression_{horodatage}.csv")
@@ -605,6 +606,7 @@ async def main():
 
 def _afficher_classements_regression(resultats: pd.DataFrame, proche_col: str) -> None:
     metriques = [
+        ("Score global", True, "Score global pondéré (↑ mieux)"),
         ("R²",       True,  "R² (↑ mieux)"),
         ("MAE (s)",  False, "MAE en secondes (↓ mieux)"),
         ("RMSE (s)", False, "RMSE (↓ mieux)"),
@@ -616,7 +618,9 @@ def _afficher_classements_regression(resultats: pd.DataFrame, proche_col: str) -
         tri = resultats.sort_values(col, ascending=not desc_asc).reset_index(drop=True)
         tri.insert(0, "Rang", range(1, len(tri) + 1))
         tri[f"{col} (moy ± std)"] = tri.apply(
-            lambda r: f"{r[col]:.3f} ± {r[std_col]:.3f}" if std_col in tri.columns else f"{r[col]:.3f}",
+            lambda r: f"{r[col]:.3f} ± {r[std_col]:.3f}"
+            if std_col in tri.columns and pd.notna(r.get(std_col, np.nan))
+            else f"{r[col]:.3f}",
             axis=1,
         )
         print(f"\n{'=' * 65}")
