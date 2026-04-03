@@ -3,8 +3,6 @@ mon_env/*
 .claude/*
 CLAUDE.md
 # Données volumineuses (ne pas commiter, trop grandes pour GitHub)
-dataset_predictions/
 dataset_other/
 output/
-passages_global.csv
 validations-reseau-ferre-profils-horaires-par-jour-type-1er-trimestre.csv

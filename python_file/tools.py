@@ -57,6 +57,21 @@ _JOURS_FERIES = {
     "2026-05-25", "2026-07-14", "2026-08-15", "2026-11-01", "2026-11-11", "2026-12-25",
 }
 
+
+# Vacances scolaires IDF (zone C) 2024-2026
+_VACANCES_IDF = [
+    ("2024-10-19", "2024-11-04"),  # Toussaint 2024
+    ("2024-12-21", "2025-01-06"),  # Noël 2024
+    ("2025-02-22", "2025-03-10"),  # Hiver 2025
+    ("2025-04-19", "2025-05-05"),  # Printemps 2025
+    ("2025-07-05", "2025-09-01"),  # Été 2025
+    ("2025-10-18", "2025-11-03"),  # Toussaint 2025
+    ("2025-12-20", "2026-01-05"),  # Noël 2025
+    ("2026-02-14", "2026-03-02"),  # Hiver 2026
+    ("2026-04-11", "2026-04-27"),  # Printemps 2026
+    ("2026-07-04", "2026-08-31"),  # Été 2026
+]
+
 # Schéma cible (ordre des colonnes dans le CSV final)
 CSV_COLONNES = [
     "line_ref", "nom_ligne", "operateur", "direction_ref", "terminus",
@@ -156,6 +171,17 @@ FEATURES_NUM = [
 ]
 FEATURES = FEATURES_CAT + FEATURES_NUM
 
+COULEURS_MODELES_REGRESSION = {
+    "GradientBoosting": "tab:blue",
+    "DecisionTree": "tab:orange",
+    "ExtraTrees": "tab:green",
+    "HistGradientBoosting": "tab:red",
+    "RandomForest": "tab:purple",
+    "KNeighbors": "tab:brown",
+    "Ridge": "tab:pink",
+    "LinearRegression": "tab:gray",
+}
+
 N_FOLDS        = 5
 RANDOM_STATE   = 42
 SEUIL_PROCHE_S = 60   # régression : prédiction "proche" si |erreur| ≤ 60 s
@@ -226,6 +252,30 @@ PARAM_GRIDS_CLASSIFICATION: dict[str, dict] = {
 }
 
 #-----
+
+def est_jour_ferie(date_str: str) -> bool:
+    """Retourne True si date_str (YYYY-MM-DD) est un jour férié français."""
+    return isinstance(date_str, str) and date_str[:10] in _JOURS_FERIES
+
+
+def est_vacances(date_str: str) -> bool:
+    """Retourne True si date_str (YYYY-MM-DD) tombe dans les vacances scolaires IDF (zone C)."""
+    if not isinstance(date_str, str) or len(date_str) < 10:
+        return False
+    d = date_str[:10]
+    return any(start <= d <= end for start, end in _VACANCES_IDF)
+
+def classifier_alerte(texte: str) -> str:
+    """Classifie le texte libre d'une alerte en catégorie interprétable."""
+    if not texte:
+        return "autre"
+    t = texte.lower()
+    for cat, mots in _KEYWORDS_ALERTE.items():
+        if any(m in t for m in mots):
+            return cat
+    return "autre"
+
+
 
 def _val(field) -> str:
     """Dépaquète les formats SIRI hybrides (str, dict, list)."""

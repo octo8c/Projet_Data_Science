@@ -232,14 +232,26 @@ def ecrire_rapport_classification(
         f"![Courbes ROC]({roc_png})\n",
         f"> Chaque courbe est la moyenne des {n_folds} folds (StratifiedKFold).\n",
         "---\n",
-        "## Classement par métrique\n",
-        f"> Métrique calculée par StratifiedKFold k={n_folds}. Format : **moyenne ± écart-type**.\n",
+        "## Matrices de confusion\n",
+        f"> Matrices agrégées sur les {n_folds} folds StratifiedKFold (somme de toutes les prédictions).\n",
+    ]
+    for png in cm_pngs:
+        nom = png.replace(f"confusion_", "").replace(f"_{horodatage}.png", "").replace("_", " ").title()
+        lignes.append(f"\n### {nom}\n")
+        lignes.append(f"![Matrice de confusion {nom}]({png})\n")
+    lignes += [
+        "---\n",
+        "## Classements par métrique\n",
+        f"> Métriques calculées par StratifiedKFold k={n_folds}. Format : **moyenne ± écart-type**.\n",
     ]
 
     configs = [
-        ("AUC", False, "AUC-ROC", "↑ mieux"),
+        ("AUC",       False, "AUC-ROC",                    "↑ mieux"),
+        ("F1",        False, "F1-score (seuil 0.5)",       "↑ mieux"),
+        ("Accuracy",  False, "Accuracy",                   "↑ mieux"),
+        ("Précision", False, "Précision",                  "↑ mieux"),
+        ("Rappel",    False, "Rappel",                     "↑ mieux"),
     ]
-
     for col, ascending, titre, sens in configs:
         tri = resultats.sort_values(col, ascending=ascending).reset_index(drop=True)
         lignes.append(f"### {titre} ({sens})\n")
@@ -259,12 +271,20 @@ def ecrire_rapport_classification(
         "| Métrique | Moyenne | Écart-type |",
         "|----------|--------:|----------:|",
         f"| AUC      | `{best['AUC']:.4f}` | `{best.get('AUC ±', float('nan')):.4f}` |",
+        f"| F1       | `{best['F1']:.4f}` | `{best.get('F1 ±', float('nan')):.4f}` |",
+        f"| Accuracy | `{best['Accuracy']:.4f}` | `{best.get('Accuracy ±', float('nan')):.4f}` |",
+        f"| Précision | `{best['Précision']:.4f}` | `{best.get('Précision ±', float('nan')):.4f}` |",
+        f"| Rappel   | `{best['Rappel']:.4f}` | `{best.get('Rappel ±', float('nan')):.4f}` |",
         f"| Params   | `{best['Meilleurs params']}` | — |\n",
         "---\n",
         "## Glossaire\n",
         "| Métrique | Description |",
         "|----------|-------------|",
         "| **AUC-ROC** | Aire sous la courbe ROC. 1 = parfait, 0.5 = aléatoire. |",
+        "| **F1** | Moyenne harmonique précision/rappel. Utile si les classes sont déséquilibrées. |",
+        "| **Accuracy** | % de prédictions correctes toutes classes confondues. |",
+        "| **Précision** | Parmi les trains prédits en retard, combien le sont vraiment. |",
+        "| **Rappel** | Parmi les trains réellement en retard, combien sont détectés. |",
         f"| **StratifiedKFold k={n_folds}** | Validation croisée stratifiée : conserve la proportion de chaque classe dans chaque fold. |",
         f"| **Seuil retard** | Un train est considéré en retard si `retard_sec > {seuil_retard}` (>{seuil_retard // 60} min). |",
     ]
