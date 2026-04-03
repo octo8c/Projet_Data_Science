@@ -33,8 +33,8 @@ from sklearn.linear_model import LinearRegression, Ridge, LogisticRegression
 from sklearn.tree import DecisionTreeRegressor, DecisionTreeClassifier
 from sklearn.ensemble import (
     RandomForestRegressor, ExtraTreesRegressor,
-    GradientBoostingRegressor, HistGradientBoostingRegressor,
-    RandomForestClassifier, GradientBoostingClassifier, HistGradientBoostingClassifier,
+    GradientBoostingRegressor,
+    RandomForestClassifier, GradientBoostingClassifier,
 )
 from sklearn.metrics import (
     accuracy_score, f1_score, precision_score, recall_score, roc_auc_score,
@@ -103,7 +103,6 @@ MODELES_REGRESSION = {
     "RandomForest":         RandomForestRegressor(random_state=RANDOM_STATE, n_jobs=1),
     "ExtraTrees":           ExtraTreesRegressor(random_state=RANDOM_STATE, n_jobs=1),
     "GradientBoosting":     GradientBoostingRegressor(random_state=RANDOM_STATE),
-    "HistGradientBoosting": HistGradientBoostingRegressor(random_state=RANDOM_STATE),
 }
 
 MODELES_CLASSIFICATION = {
@@ -111,7 +110,6 @@ MODELES_CLASSIFICATION = {
     "DecisionTree":         DecisionTreeClassifier(random_state=RANDOM_STATE),
     "RandomForest":         RandomForestClassifier(random_state=RANDOM_STATE, n_jobs=1),
     "GradientBoosting":     GradientBoostingClassifier(random_state=RANDOM_STATE),
-    "HistGradientBoosting": HistGradientBoostingClassifier(random_state=RANDOM_STATE),
 }
 
 # ── Grilles de paramètres ─────────────────────
@@ -137,12 +135,6 @@ PARAM_GRIDS_REGRESSION: dict[str, dict] = {
         "learning_rate": [0.05, 0.1, 0.2],
         "max_depth":     [3, 5],
     },
-    "HistGradientBoosting": {
-        "max_iter":          [100, 200],
-        "learning_rate":     [0.05, 0.1, 0.2],
-        "max_leaf_nodes":    [15, 31, 63],
-        "l2_regularization": [0.0, 0.1, 1.0],
-    },
 }
 
 PARAM_GRIDS_CLASSIFICATION: dict[str, dict] = {
@@ -160,11 +152,6 @@ PARAM_GRIDS_CLASSIFICATION: dict[str, dict] = {
         "n_estimators":  [100, 200],
         "learning_rate": [0.05, 0.1],
         "max_depth":     [3, 5],
-    },
-    "HistGradientBoosting": {
-        "max_iter":       [100, 200],
-        "learning_rate":  [0.05, 0.1],
-        "max_leaf_nodes": [15, 31],
     },
 }
 
@@ -582,14 +569,14 @@ def _sous_echantillonner(df: pd.DataFrame, group_col: str = "nom_ligne") -> pd.D
     """
     y = (df[TARGET] >= SEUIL_RETARD).astype(int)
     df_tmp = df.copy()
-    df_tmp["_y"] = y
+    df_tmp["y"] = y
 
     kept: list[int] = []
     rng = np.random.default_rng(RANDOM_STATE)
 
     for _, grp in df_tmp.groupby(group_col, sort=False):
-        pos_idx = grp[grp["_y"] == 1].index.tolist()
-        neg_idx = grp[grp["_y"] == 0].index.tolist()
+        pos_idx = grp[grp["y"] == 1].index.tolist()
+        neg_idx = grp[grp["y"] == 0].index.tolist()
         n_pos = len(pos_idx)
         if n_pos == 0:
             continue
@@ -633,11 +620,37 @@ async def evaluer_classification(df: pd.DataFrame, label: str) -> tuple[pd.DataF
     print(f"  Évaluation : StratifiedKFold k={N_FOLDS}  ({len(X):,} lignes)\n")
 
     skf = StratifiedKFold(n_splits=N_FOLDS, shuffle=False)
+    cache = _lire_cache(_CACHE_CLASSIFICATION)
     lignes: list[dict] = []
     cm_data: dict[str, list] = {}
     roc_data: dict[str, tuple] = {}
 
     for nom, modele in MODELES_CLASSIFICATION.items():
+        param_grid = PARAM_GRIDS_CLASSIFICATION.get(nom, {})
+        cached = cache.get(nom)
+        if cached:
+            modele.set_params(**cached)
+            print(f"  [Cache utilisé] {nom:<25} → {cached}")
+        elif param_grid:
+            prefixed = {f"model__{k}": v for k, v in param_grid.items()}
+            pipe_gs = Pipeline([
+                ("encoder", ColumnTransformer([
+                    ("cat", Pipeline([
+                        ("imputer", SimpleImputer(strategy="constant", fill_value="inconnu")),
+                        ("te",      TargetEncoder(smooth="auto", target_type="binary", random_state=RANDOM_STATE)),
+                    ]), cols_cat),
+                    ("num", "passthrough", cols_num),
+                ])),
+                ("model", modele),
+            ])
+            from sklearn.model_selection import GridSearchCV
+            gs = GridSearchCV(pipe_gs, prefixed, cv=3, scoring="roc_auc", n_jobs=1)
+            gs.fit(X, y)
+            best = {k[len("model__"):]: v for k, v in gs.best_params_.items()}
+            modele.set_params(**best)
+            _maj_cache(_CACHE_CLASSIFICATION, nom, best)
+            print(f"  [GridSearch OK] {nom:<25} → {best}")
+
         pipeline = Pipeline([
             ("encoder", ColumnTransformer([
                 ("cat", Pipeline([
@@ -795,7 +808,6 @@ async def main():
     df = transformer_dataset(df)
 
     from datetime import datetime
-    from rapport import ecrire_rapport_regression, ecrire_rapport_classification
 
     horodatage = datetime.now().strftime("%Y%m%d_%H%M%S")
     os.makedirs(_DOSSIER, exist_ok=True)
@@ -815,18 +827,6 @@ async def main():
     out_csv_reg = os.path.join(_DOSSIER, f"resultats_regression_{horodatage}.csv")
     res_reg.to_csv(out_csv_reg, index=False)
     print(f"\nRésultats CSV régression    → {out_csv_reg}")
-
-    out_md_reg = ecrire_rapport_regression(
-        resultats    = res_reg,
-        dossier      = _DOSSIER,
-        horodatage   = horodatage,
-        csv_source   = args.csv,
-        n_lignes     = len(df),
-        features     = FEATURES,
-        n_folds      = N_FOLDS,
-        seuil_proche = SEUIL_PROCHE_S,
-    )
-    print(f"Rapport Markdown régression → {out_md_reg}")
 
     # ══════════════════════════════════════════
     # CLASSIFICATION
@@ -849,20 +849,6 @@ async def main():
     out_cms = tracer_matrices_confusion(cm_data, horodatage)
     for p in out_cms:
         print(f"Matrice de confusion (PNG)   → {p}")
-
-    out_md_clf = ecrire_rapport_classification(
-        resultats    = res_clf,
-        dossier      = _DOSSIER,
-        horodatage   = horodatage,
-        csv_source   = args.csv,
-        n_lignes     = len(df),
-        features     = FEATURES,
-        n_folds      = N_FOLDS,
-        seuil_retard = SEUIL_RETARD,
-        roc_png      = os.path.basename(out_roc),
-        cm_pngs      = [os.path.basename(p) for p in out_cms],
-    )
-    print(f"Rapport Markdown classification → {out_md_clf}")
 
 
 def _afficher_classements_regression(resultats: pd.DataFrame, proche_col: str) -> None:
