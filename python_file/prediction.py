@@ -34,6 +34,17 @@ from evaluation_modeles import (DOSSIER, evaluer_regression, evaluer_classificat
 
 warnings.filterwarnings("ignore")
 
+COULEURS_MODELES_REGRESSION = {
+    "GradientBoosting": "tab:blue",
+    "DecisionTree": "tab:orange",
+    "ExtraTrees": "tab:green",
+    "HistGradientBoosting": "tab:red",
+    "RandomForest": "tab:purple",
+    "KNeighbors": "tab:brown",
+    "Ridge": "tab:pink",
+    "LinearRegression": "tab:gray",
+}
+
 # ─────────────────────────────────────────────
 # CHARGEMENT DES DONNÉES
 # ─────────────────────────────────────────────
@@ -125,7 +136,8 @@ def tracer_scores_regression(resultats: pd.DataFrame, horodatage: str) -> str:
     tri = resultats.sort_values("Score global", ascending=False).reset_index(drop=True)
 
     fig, ax = plt.subplots(figsize=(10, 6))
-    ax.bar(tri["Modèle"], tri["Score global"])
+    couleurs = [COULEURS_MODELES_REGRESSION.get(m, "tab:blue") for m in tri["Modèle"]]
+    ax.bar(tri["Modèle"], tri["Score global"], color=couleurs)
 
     ax.set_title("Score global des modèles de régression", fontsize=13)
     ax.set_xlabel("Modèle", fontsize=11)
@@ -195,8 +207,9 @@ def tracer_radar_regression(resultats: pd.DataFrame, proche_col: str, horodatage
     for _, row in radar_df.iterrows():
         values = [row[c] for c in categories]
         values += values[:1]
-        ax.plot(angles, values, linewidth=2, label=row["Modèle"])
-        ax.fill(angles, values, alpha=0.08)
+        couleur = COULEURS_MODELES_REGRESSION.get(row["Modèle"], "tab:blue")
+        ax.plot(angles, values, linewidth=2, label=row["Modèle"], color=couleur)
+        ax.fill(angles, values, alpha=0.08, color=couleur)
 
     ax.set_xticks(angles[:-1])
     ax.set_xticklabels(categories, fontsize=11)

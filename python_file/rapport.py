@@ -163,7 +163,7 @@ def ecrire_rapport_regression(
 
     lignes += [
         "---\n",
-        "## Meilleur modèle global ({tl.CRITERE_SELECTION_REGRESSION})\n",
+        f"## Meilleur modèle global ({tl.CRITERE_SELECTION_REGRESSION})\n",
         f"**[{best['Dataset']}] {best['Modèle']}**\n",
         "| Métrique | Moyenne | Écart-type |",
         "|----------|--------:|----------:|",
