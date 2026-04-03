@@ -4,6 +4,7 @@ rapport.py — Génère les rapports Markdown à partir des résultats de predic
 
 import os
 import pandas as pd
+import tools as tl
 
 
 _FEAT_GROUPS = {
@@ -98,10 +99,12 @@ def ecrire_rapport_regression(
     features: list[str],
     n_folds: int,
     seuil_proche: int,
+    score_png: str,
+    radar_png: str,
 ) -> str:
     """Génère rapport_regression_<horodatage>.md. Retourne le chemin."""
     proche_col = f"Proche≤{seuil_proche}s (%)"
-    best = resultats.sort_values("Score global", ascending=False).iloc[0]
+    best = resultats.sort_values(tl.CRITERE_SELECTION_REGRESSION, ascending=False).iloc[0]
 
     lignes = _entete(
         "Rapport — Comparaison des modèles de régression IDFM",
@@ -115,6 +118,18 @@ def ecrire_rapport_regression(
         "### Détail des features\n",
     ]
     lignes += _feat_table(features)
+    lignes += [
+        "",
+        "---\n",
+        "## Visualisation du score global\n",
+        f"![Score global des modèles de régression]({score_png})\n",
+        "> Plus le score global est élevé, meilleur est le compromis global entre R², RMSE, MAE, MAPE et pourcentage de prédictions proches.\n",
+    ]
+    lignes += [
+        "## Visualisation radar des modèles\n",
+        f"![Radar des modèles de régression]({radar_png})\n",
+        "> Chaque axe correspond à une métrique normalisée entre 0 et 1. Pour toutes les dimensions, plus la valeur est élevée, meilleur est le modèle.\n",
+    ]
     lignes += [
         "",
         "---\n",
@@ -148,7 +163,7 @@ def ecrire_rapport_regression(
 
     lignes += [
         "---\n",
-        "## Meilleur modèle global (Score global)\n",
+        "## Meilleur modèle global ({tl.CRITERE_SELECTION_REGRESSION})\n",
         f"**[{best['Dataset']}] {best['Modèle']}**\n",
         "| Métrique | Moyenne | Écart-type |",
         "|----------|--------:|----------:|",

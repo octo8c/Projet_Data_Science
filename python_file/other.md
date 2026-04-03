@@ -1,5 +1,5 @@
 
-```
+```py
 def _train_eval_classification(
     nom: str,
     modele,
@@ -96,7 +96,7 @@ def _train_eval_classification(
 
 ```
 
-```
+```py
 async def evaluer_classification(df: pd.DataFrame, label: str) -> tuple[pd.DataFrame, dict, dict]:
     """
     Retourne (DataFrame résultats, dict {nom_modèle: (_fpr, _tpr)})
@@ -183,7 +183,7 @@ async def evaluer_classification(df: pd.DataFrame, label: str) -> tuple[pd.DataF
     return pd.DataFrame(lignes), roc_data, cm_data
 ```
 
-```
+```py
 # ══════════════════════════════════════════
 # CLASSIFICATION
 # ══════════════════════════════════════════
@@ -219,4 +219,50 @@ async def evaluer_classification(df: pd.DataFrame, label: str) -> tuple[pd.DataF
         cm_pngs      = [os.path.basename(p) for p in out_cms],
     )
     print(f"Rapport Markdown classification → {out_md_clf}")
+```
+```py
+def tracer_matrices_confusion(cm_data: dict, horodatage: str) -> list[str]:
+    """
+    Trace une matrice de confusion par modèle, chacune dans son propre PNG.
+    Retourne la liste des chemins créés.
+    """
+    import matplotlib.pyplot as plt
+
+    os.makedirs(_DOSSIER, exist_ok=True)
+    chemins = []
+
+    for nom, cm_list in cm_data.items():
+        cm  = np.array(cm_list)
+        fig, ax = plt.subplots(figsize=(5, 4))
+        im = ax.imshow(cm, interpolation="nearest", cmap="Blues")
+        fig.colorbar(im, ax=ax, shrink=0.8)
+
+        ax.set_title(
+            f"{nom}\nMatrice de confusion — retard > {tl.SEUIL_RETARD}s\n"
+            f"(agrégée sur {tl.N_FOLDS} folds StratifiedKFold)",
+            fontsize=10, fontweight="bold",
+        )
+        ax.set_xlabel("Prédit", fontsize=9)
+        ax.set_ylabel("Réel", fontsize=9)
+        tick_labels = ["À l'heure (0)", "En retard (1)"]
+        ax.set_xticks([0, 1])
+        ax.set_yticks([0, 1])
+        ax.set_xticklabels(tick_labels, fontsize=9, rotation=15)
+        ax.set_yticklabels(tick_labels, fontsize=9)
+
+        thresh = cm.max() / 2.0
+        for row in range(cm.shape[0]):
+            for col in range(cm.shape[1]):
+                ax.text(col, row, f"{cm[row, col]:,}",
+                        ha="center", va="center", fontsize=12,
+                        color="white" if cm[row, col] > thresh else "black")
+
+        fig.tight_layout()
+        nom_fichier = nom.replace(" ", "_").lower()
+        chemin = os.path.join(_DOSSIER, f"confusion_{nom_fichier}_{horodatage}.png")
+        fig.savefig(chemin, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        chemins.append(chemin)
+
+    return chemins
 ```

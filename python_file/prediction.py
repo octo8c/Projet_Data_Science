@@ -441,52 +441,6 @@ async def evaluer_classification(df: pd.DataFrame, label: str) -> tuple[pd.DataF
 # GRAPHIQUES ROC
 # ─────────────────────────────────────────────
 
-def tracer_matrices_confusion(cm_data: dict, horodatage: str) -> list[str]:
-    """
-    Trace une matrice de confusion par modèle, chacune dans son propre PNG.
-    Retourne la liste des chemins créés.
-    """
-    import matplotlib.pyplot as plt
-
-    os.makedirs(_DOSSIER, exist_ok=True)
-    chemins = []
-
-    for nom, cm_list in cm_data.items():
-        cm  = np.array(cm_list)
-        fig, ax = plt.subplots(figsize=(5, 4))
-        im = ax.imshow(cm, interpolation="nearest", cmap="Blues")
-        fig.colorbar(im, ax=ax, shrink=0.8)
-
-        ax.set_title(
-            f"{nom}\nMatrice de confusion — retard > {tl.SEUIL_RETARD}s\n"
-            f"(agrégée sur {tl.N_FOLDS} folds StratifiedKFold)",
-            fontsize=10, fontweight="bold",
-        )
-        ax.set_xlabel("Prédit", fontsize=9)
-        ax.set_ylabel("Réel", fontsize=9)
-        tick_labels = ["À l'heure (0)", "En retard (1)"]
-        ax.set_xticks([0, 1])
-        ax.set_yticks([0, 1])
-        ax.set_xticklabels(tick_labels, fontsize=9, rotation=15)
-        ax.set_yticklabels(tick_labels, fontsize=9)
-
-        thresh = cm.max() / 2.0
-        for row in range(cm.shape[0]):
-            for col in range(cm.shape[1]):
-                ax.text(col, row, f"{cm[row, col]:,}",
-                        ha="center", va="center", fontsize=12,
-                        color="white" if cm[row, col] > thresh else "black")
-
-        fig.tight_layout()
-        nom_fichier = nom.replace(" ", "_").lower()
-        chemin = os.path.join(_DOSSIER, f"confusion_{nom_fichier}_{horodatage}.png")
-        fig.savefig(chemin, dpi=150, bbox_inches="tight")
-        plt.close(fig)
-        chemins.append(chemin)
-
-    return chemins
-
-
 def tracer_courbes_roc(roc_data: dict, horodatage: str) -> str:
     """Trace toutes les courbes ROC sur un même graphique. Retourne le chemin du PNG."""
     import matplotlib.pyplot as plt
@@ -515,6 +469,108 @@ def tracer_courbes_roc(roc_data: dict, horodatage: str) -> str:
     plt.close(fig)
     return chemin
 
+def tracer_scores_regression(resultats: pd.DataFrame, horodatage: str) -> str:
+    """
+    Trace un bar chart du score global de régression par modèle.
+    Retourne le chemin du PNG créé.
+    """
+    import matplotlib.pyplot as plt
+
+    tri = resultats.sort_values("Score global", ascending=False).reset_index(drop=True)
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+    ax.bar(tri["Modèle"], tri["Score global"])
+
+    ax.set_title("Score global des modèles de régression", fontsize=13)
+    ax.set_xlabel("Modèle", fontsize=11)
+    ax.set_ylabel("Score global", fontsize=11)
+    ax.set_ylim(0, 1.05)
+    ax.grid(axis="y", alpha=0.3)
+
+    plt.xticks(rotation=25, ha="right")
+
+    for i, v in enumerate(tri["Score global"]):
+        ax.text(i, v + 0.015, f"{v:.3f}", ha="center", fontsize=9)
+
+    fig.tight_layout()
+
+    os.makedirs(_DOSSIER, exist_ok=True)
+    chemin = os.path.join(_DOSSIER, f"regression_scores_{horodatage}.png")
+    fig.savefig(chemin, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+    return chemin
+
+def tracer_radar_regression(resultats: pd.DataFrame, proche_col: str, horodatage: str) -> str:
+    """
+    Trace un radar chart comparant les modèles de régression
+    sur plusieurs métriques normalisées dans [0, 1].
+    Plus la valeur est grande, meilleur est le modèle.
+    """
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    df = resultats.copy()
+
+    def normaliser_positif(s: pd.Series) -> pd.Series:
+        s = pd.to_numeric(s, errors="coerce")
+        s_min, s_max = s.min(), s.max()
+        if pd.isna(s_min) or pd.isna(s_max):
+            return pd.Series(0.0, index=s.index)
+        if s_max == s_min:
+            return pd.Series(1.0, index=s.index)
+        return (s - s_min) / (s_max - s_min)
+
+    def normaliser_negatif(s: pd.Series) -> pd.Series:
+        s = pd.to_numeric(s, errors="coerce")
+        s_min, s_max = s.min(), s.max()
+        if pd.isna(s_min) or pd.isna(s_max):
+            return pd.Series(0.0, index=s.index)
+        if s_max == s_min:
+            return pd.Series(1.0, index=s.index)
+        return (s_max - s) / (s_max - s_min)
+
+    radar_df = pd.DataFrame({
+        "Modèle": df["Modèle"],
+        "R²": normaliser_positif(df["R²"]),
+        "MAE": normaliser_negatif(df["MAE (s)"]),
+        "RMSE": normaliser_negatif(df["RMSE (s)"]),
+        "MAPE": normaliser_negatif(df["MAPE (%)"]),
+        "Proche": normaliser_positif(df[proche_col]),
+    })
+
+    categories = ["R²", "MAE", "RMSE", "MAPE", "Proche"]
+    N = len(categories)
+    angles = np.linspace(0, 2 * np.pi, N, endpoint=False).tolist()
+    angles += angles[:1]
+
+    fig, ax = plt.subplots(figsize=(9, 9), subplot_kw=dict(polar=True))
+
+    for _, row in radar_df.iterrows():
+        values = [row[c] for c in categories]
+        values += values[:1]
+        ax.plot(angles, values, linewidth=2, label=row["Modèle"])
+        ax.fill(angles, values, alpha=0.08)
+
+    ax.set_xticks(angles[:-1])
+    ax.set_xticklabels(categories, fontsize=11)
+    ax.set_yticks([0.2, 0.4, 0.6, 0.8, 1.0])
+    ax.set_yticklabels(["0.2", "0.4", "0.6", "0.8", "1.0"], fontsize=9)
+    ax.set_ylim(0, 1)
+
+    ax.set_title(
+        "Radar chart — comparaison des modèles de régression\n(métriques normalisées, plus grand = mieux)",
+        fontsize=13,
+        pad=25,
+    )
+    ax.legend(loc="upper right", bbox_to_anchor=(1.3, 1.1), fontsize=9)
+
+    os.makedirs(_DOSSIER, exist_ok=True)
+    chemin = os.path.join(_DOSSIER, f"regression_radar_{horodatage}.png")
+    fig.savefig(chemin, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+    return chemin
 
 # ─────────────────────────────────────────────
 # MAIN
@@ -554,6 +610,13 @@ async def main():
     proche_col = f"Proche≤{tl.SEUIL_PROCHE_S}s (%)"
     res_reg = tl.ajouter_score_global_regression(res_reg, proche_col)
     _afficher_classements_regression(res_reg, proche_col)
+    _afficher_meilleur_modele_regression(res_reg, proche_col)
+
+    out_reg_plot = tracer_scores_regression(res_reg, horodatage)
+    print(f"Graphique score régression  → {out_reg_plot}")
+
+    out_reg_radar = tracer_radar_regression(res_reg, proche_col, horodatage)
+    print(f"Radar régression            → {out_reg_radar}")
 
     out_csv_reg = os.path.join(_DOSSIER, f"resultats_regression_{horodatage}.csv")
     res_reg.to_csv(out_csv_reg, index=False)
@@ -568,6 +631,8 @@ async def main():
         features     = tl.FEATURES,
         n_folds      = tl.N_FOLDS,
         seuil_proche = tl.SEUIL_PROCHE_S,
+        score_png    = os.path.basename(out_reg_plot),
+        radar_png    = os.path.basename(out_reg_radar),
     )
     print(f"Rapport Markdown régression → {out_md_reg}")
 
@@ -603,6 +668,21 @@ async def main():
     )
     print(f"Rapport Markdown classification → {out_md_clf}")
 
+def _afficher_meilleur_modele_regression(resultats: pd.DataFrame, proche_col: str) -> None:
+    best = tl.selectionner_meilleur_modele_regression(resultats)
+
+    print(f"\n{'=' * 65}")
+    print(f"  MEILLEUR MODÈLE RÉGRESSION ({tl.CRITERE_SELECTION_REGRESSION})")
+    print("=" * 65)
+    print(f"Modèle retenu : {best['Modèle']}")
+    print(f"Dataset       : {best['Dataset']}")
+    print(f"Score global  : {best['Score global']:.3f}")
+    print(f"R²            : {best['R²']:.3f} ± {best.get('R² ±', float('nan')):.3f}")
+    print(f"MAE (s)       : {best['MAE (s)']:.1f} ± {best.get('MAE (s) ±', float('nan')):.1f}")
+    print(f"RMSE (s)      : {best['RMSE (s)']:.1f} ± {best.get('RMSE (s) ±', float('nan')):.1f}")
+    print(f"MAPE (%)      : {best['MAPE (%)']:.1f} ± {best.get('MAPE (%) ±', float('nan')):.1f}")
+    print(f"{proche_col:<14}: {best[proche_col]:.1f}% ± {best.get(proche_col + ' ±', float('nan')):.1f}%")
+    print(f"Params        : {best['Meilleurs params']}\n")
 
 def _afficher_classements_regression(resultats: pd.DataFrame, proche_col: str) -> None:
     metriques = [

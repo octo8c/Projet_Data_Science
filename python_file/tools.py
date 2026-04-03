@@ -160,7 +160,7 @@ N_FOLDS        = 5
 RANDOM_STATE   = 42
 SEUIL_PROCHE_S = 60   # régression : prédiction "proche" si |erreur| ≤ 60 s
 SEUIL_RETARD   = 300  # classification : retard si > 5 min
-
+CRITERE_SELECTION_REGRESSION = "Score global"
 
 # ── Grilles de paramètres ─────────────────────
 PARAM_GRIDS_REGRESSION: dict[str, dict] = {
@@ -453,3 +453,15 @@ def ajouter_score_global_regression(
     )
 
     return df
+
+def selectionner_meilleur_modele_regression(
+    resultats: pd.DataFrame,
+    critere: str = CRITERE_SELECTION_REGRESSION,
+) -> pd.Series:
+    """
+    Retourne la ligne du meilleur modèle de régression selon le critère choisi.
+    """
+    if critere not in resultats.columns:
+        raise KeyError(f"Critère de sélection introuvable dans les résultats : {critere}")
+
+    return resultats.sort_values(critere, ascending=False).iloc[0]
