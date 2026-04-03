@@ -146,7 +146,7 @@ def ecrire_rapport_regression(
         f"| RMSE (s) | `{best['RMSE (s)']:.1f}` | `{best.get('RMSE (s) ±', float('nan')):.1f}` |",
         f"| MAPE (%) | `{best['MAPE (%)']:.1f}` | `{best.get('MAPE (%) ±', float('nan')):.1f}` |",
         f"| {proche_col} | `{best[proche_col]:.1f}%` | `{best.get(proche_col + ' ±', float('nan')):.1f}%` |",
-        f"| Params   | `{best['Meilleurs params']}` | — |\n",
+        f"| Params   | `{best.get('Meilleurs params', '—')}` | — |\n",
         "---\n",
         "## Glossaire\n",
         "| Métrique | Description |",
@@ -232,7 +232,7 @@ def ecrire_rapport_classification(
         for rang, (_, row) in enumerate(tri.iterrows(), start=1):
             lignes.append(
                 f"| {rang} | {row['Modèle']} "
-                f"| {_fmt(row, col)} | `{row['Meilleurs params']}` |"
+                f"| {_fmt(row, col)} | `{row.get('Meilleurs params', '—')}` |"
             )
         lignes.append("")
 
@@ -247,7 +247,7 @@ def ecrire_rapport_classification(
         f"| Accuracy | `{best['Accuracy']:.4f}` | `{best.get('Accuracy ±', float('nan')):.4f}` |",
         f"| Précision | `{best['Précision']:.4f}` | `{best.get('Précision ±', float('nan')):.4f}` |",
         f"| Rappel   | `{best['Rappel']:.4f}` | `{best.get('Rappel ±', float('nan')):.4f}` |",
-        f"| Params   | `{best['Meilleurs params']}` | — |\n",
+        f"| Params   | `{best.get('Meilleurs params', '—')}` | — |\n",
         "---\n",
         "## Glossaire\n",
         "| Métrique | Description |",

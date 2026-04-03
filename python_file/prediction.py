@@ -31,7 +31,6 @@ import pandas as pd
 from sklearn.compose import ColumnTransformer
 from sklearn.linear_model import LinearRegression, Ridge, LogisticRegression
 from sklearn.tree import DecisionTreeRegressor, DecisionTreeClassifier
-from sklearn.svm import SVC
 from sklearn.ensemble import (
     RandomForestRegressor, ExtraTreesRegressor,
     GradientBoostingRegressor, HistGradientBoostingRegressor,
@@ -42,7 +41,6 @@ from sklearn.metrics import (
     confusion_matrix,
 )
 from sklearn.model_selection import cross_val_score, cross_val_predict, cross_validate, StratifiedKFold
-from sklearn.neighbors import KNeighborsRegressor, KNeighborsClassifier
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import TargetEncoder
 
@@ -54,13 +52,20 @@ warnings.filterwarnings("ignore")
 
 TARGET = "retard_sec"
 
+LIGNES_RER_TRANSILIEN = {
+    "RER A", "RER B", "RER C", "RER D", "RER E",
+    "Ligne H", "Ligne J", "Ligne K", "Ligne L",
+    "Ligne N", "Ligne P", "Ligne R", "Ligne U",
+}
+
 # Colonnes pour KFold target encoding (traitées dans evaluer_*(), pas ici)
 FEATURES_CAT_TARGET = ["nom_ligne", "terminus", "stop_ref"]
 
 # Features numériques + OHE disponibles directement après transformer_dataset()
 FEATURES_NUM = [
     # Numériques brutes
-    "mois", "jour_ferie", "vacances", "occupation",
+    "heure_tranche", "direction_ref",
+    "mois", "jour_ferie", "vacances", "est_vacances", "occupation",
     "terminus_encoded", "station_encoded", "alerte_active",
     "precipitation", "snowfall", "wind_speed", "temperature",
     # OHE periode_journee
@@ -99,17 +104,14 @@ MODELES_REGRESSION = {
     "ExtraTrees":           ExtraTreesRegressor(random_state=RANDOM_STATE, n_jobs=1),
     "GradientBoosting":     GradientBoostingRegressor(random_state=RANDOM_STATE),
     "HistGradientBoosting": HistGradientBoostingRegressor(random_state=RANDOM_STATE),
-    "KNeighbors":           KNeighborsRegressor(n_jobs=1),
 }
 
 MODELES_CLASSIFICATION = {
     "LogisticRegression":   LogisticRegression(max_iter=1000),
-    "SVC":                  SVC(probability=True, random_state=RANDOM_STATE),
     "DecisionTree":         DecisionTreeClassifier(random_state=RANDOM_STATE),
     "RandomForest":         RandomForestClassifier(random_state=RANDOM_STATE, n_jobs=1),
     "GradientBoosting":     GradientBoostingClassifier(random_state=RANDOM_STATE),
     "HistGradientBoosting": HistGradientBoostingClassifier(random_state=RANDOM_STATE),
-    "KNeighbors":           KNeighborsClassifier(n_jobs=1),
 }
 
 # ── Grilles de paramètres ─────────────────────
@@ -141,15 +143,10 @@ PARAM_GRIDS_REGRESSION: dict[str, dict] = {
         "max_leaf_nodes":    [15, 31, 63],
         "l2_regularization": [0.0, 0.1, 1.0],
     },
-    "KNeighbors": {
-        "n_neighbors": [5, 10, 20, 50],
-        "weights":     ["uniform", "distance"],
-    },
 }
 
 PARAM_GRIDS_CLASSIFICATION: dict[str, dict] = {
     "LogisticRegression": {"C": [0.01, 0.1, 1.0, 10.0]},
-    "SVC":                {"C": [0.1, 1.0, 10.0], "kernel": ["rbf", "linear"]},
     "DecisionTree": {
         "max_depth":         [3, 5, 8, 12],
         "min_samples_split": [2, 10, 50],
@@ -168,10 +165,6 @@ PARAM_GRIDS_CLASSIFICATION: dict[str, dict] = {
         "max_iter":       [100, 200],
         "learning_rate":  [0.05, 0.1],
         "max_leaf_nodes": [15, 31],
-    },
-    "KNeighbors": {
-        "n_neighbors": [5, 10, 20, 50],
-        "weights":     ["uniform", "distance"],
     },
 }
 
@@ -257,16 +250,27 @@ def transformer_dataset(df: pd.DataFrame) -> pd.DataFrame:
         "horaire_arrivee_prevu", "horaire_depart_prevu",
         "horaire_arrivee_estime", "horaire_depart_estime",
         "arrivee_prevue_hhmm", "depart_prevu_hhmm", "depart_estime_hhmm",
-        "date_capture", "line_ref", "operateur", "stop_ref", "nom_arret",
+        "date_capture", "line_ref", "operateur", "nom_arret",
     ] if c in df.columns])
 
     # ── 2. Booléens → 0/1 via LabelBinarizer ─────────────────────────────────
-    for col in ("alerte_active", "jour_ferie", "vacances"):
+    for col in ("alerte_active", "jour_ferie", "vacances", "est_vacances"):
         if col in df.columns:
             lb = LabelBinarizer()
             vals = df[col].map({True: "1", False: "0", "True": "1", "False": "0",
                                 1: "1", 0: "0"}).fillna("0")
             df[col] = np.asarray(lb.fit_transform(vals)).ravel().astype(int)
+
+    # ── 3. direction_ref → 0/1  (Aller/inbound/A = 1, Retour/outbound/R = 0) ─
+    if "direction_ref" in df.columns:
+        aller  = {"Aller", "inbound", "A", "1", "aller"}
+        retour = {"Retour", "outbound", "R", "2", "retour"}
+        def _encode_dir(v):
+            s = str(v).strip()
+            if s in aller:  return 1
+            if s in retour: return 0
+            return np.nan
+        df["direction_ref"] = df["direction_ref"].map(_encode_dir).fillna(0).astype(int)
 
     # ── Helper OHE sklearn ────────────────────────────────────────────────────
     def _ohe_sklearn(df: pd.DataFrame, col: str, prefix: str,
@@ -346,12 +350,20 @@ def _train_eval_regression(
     if cached_params:
         best_params = cached_params
     elif param_grid:
+        # Sous-échantillonnage pour accélérer le GridSearch (max 50 000 lignes)
+        _GS_MAX = 50_000
+        if len(X) > _GS_MAX:
+            rng_gs = _np.random.default_rng(42)
+            idx_gs = rng_gs.choice(len(X), size=_GS_MAX, replace=False)
+            X_gs, y_gs = X[idx_gs], y[idx_gs]
+        else:
+            X_gs, y_gs = X, y
         gs = GridSearchCV(sk_clone(modele), param_grid, cv=3, scoring="r2", n_jobs=1)
-        gs.fit(X, y)
+        gs.fit(X_gs, y_gs)
         best_params = gs.best_params_
         gs_run = True
 
-    kf = KFold(n_splits=n_folds, shuffle=True, random_state=42)
+    kf = KFold(n_splits=n_folds, shuffle=False)
     maes, rmses, r2s, mapes, proches = [], [], [], [], []
 
     for train_idx, test_idx in kf.split(X):
@@ -557,6 +569,39 @@ async def evaluer_regression(df: pd.DataFrame, label: str) -> pd.DataFrame:
 
 
 # ─────────────────────────────────────────────
+# SOUS-ÉCHANTILLONNAGE STRATIFIÉ PAR LIGNE
+# ─────────────────────────────────────────────
+
+def _sous_echantillonner(df: pd.DataFrame, group_col: str = "nom_ligne") -> pd.DataFrame:
+    """Sous-échantillonne la classe majoritaire (à l'heure) en préservant
+    les proportions de chaque ligne de transport.
+
+    Pour chaque ligne : garde tous les passages en retard (classe 1) et
+    tire aléatoirement le même nombre de passages à l'heure (classe 0).
+    L'ordre chronologique des indices est conservé.
+    """
+    y = (df[TARGET] >= SEUIL_RETARD).astype(int)
+    df_tmp = df.copy()
+    df_tmp["_y"] = y
+
+    kept: list[int] = []
+    rng = np.random.default_rng(RANDOM_STATE)
+
+    for _, grp in df_tmp.groupby(group_col, sort=False):
+        pos_idx = grp[grp["_y"] == 1].index.tolist()
+        neg_idx = grp[grp["_y"] == 0].index.tolist()
+        n_pos = len(pos_idx)
+        if n_pos == 0:
+            continue
+        n_sample = min(len(neg_idx), n_pos)
+        neg_sampled = rng.choice(neg_idx, size=n_sample, replace=False).tolist()
+        kept.extend(pos_idx + neg_sampled)
+
+    kept.sort()  # préserve l'ordre chronologique
+    return df.loc[kept].reset_index(drop=True)
+
+
+# ─────────────────────────────────────────────
 # ÉVALUATION CLASSIFICATION (async)
 # ─────────────────────────────────────────────
 
@@ -566,6 +611,18 @@ async def evaluer_classification(df: pd.DataFrame, label: str) -> tuple[pd.DataF
     """
     from sklearn.impute import SimpleImputer
 
+    # ── Affichage déséquilibre initial ────────────────────────────────────────
+    y_init = (df[TARGET] >= SEUIL_RETARD).astype(int)
+    n_pos_init, n_neg_init = y_init.sum(), (y_init == 0).sum()
+    print(f"  Déséquilibre initial — Classe 0: {n_neg_init:,}  |  Classe 1: {n_pos_init:,}"
+          f"  (ratio {n_pos_init / max(len(y_init), 1):.1%} retards)")
+
+    # ── Sous-échantillonnage stratifié par ligne ──────────────────────────────
+    if "nom_ligne" in df.columns and n_pos_init > 0:
+        df = _sous_echantillonner(df, group_col="nom_ligne")
+        y_after = (df[TARGET] >= SEUIL_RETARD).astype(int)
+        print(f"  Après rééchantillonnage    — Classe 0: {(y_after==0).sum():,}  |  Classe 1: {y_after.sum():,}")
+
     cols_cat = [c for c in FEATURES_CAT_TARGET if c in df.columns]
     cols_num = [c for c in FEATURES_NUM        if c in df.columns]
     X = df[cols_cat + cols_num]
@@ -573,12 +630,12 @@ async def evaluer_classification(df: pd.DataFrame, label: str) -> tuple[pd.DataF
 
     n_pos = y.sum()
     n_neg = len(y) - n_pos
-    print(f"  Classe 0 (à l'heure) : {n_neg:,}  |  Classe 1 (retard >{SEUIL_RETARD}s) : {n_pos:,}")
     print(f"  Évaluation : StratifiedKFold k={N_FOLDS}  ({len(X):,} lignes)\n")
 
-    skf = StratifiedKFold(n_splits=N_FOLDS, shuffle=True, random_state=RANDOM_STATE)
+    skf = StratifiedKFold(n_splits=N_FOLDS, shuffle=False)
     lignes: list[dict] = []
     cm_data: dict[str, list] = {}
+    roc_data: dict[str, tuple] = {}
 
     for nom, modele in MODELES_CLASSIFICATION.items():
         pipeline = Pipeline([
@@ -593,7 +650,12 @@ async def evaluer_classification(df: pd.DataFrame, label: str) -> tuple[pd.DataF
         ])
 
         auc_scores = cross_val_score(pipeline, X, y, cv=skf, scoring="roc_auc", n_jobs=1)
-        y_pred     = cross_val_predict(pipeline, X, y, cv=skf, method="predict", n_jobs=1)
+        y_pred     = cross_val_predict(pipeline, X, y, cv=skf, method="predict",       n_jobs=1)
+        y_proba    = cross_val_predict(pipeline, X, y, cv=skf, method="predict_proba", n_jobs=1)[:, 1]
+
+        from sklearn.metrics import roc_curve as _roc_curve
+        fpr, tpr, _ = _roc_curve(y, y_proba)
+        roc_data[nom] = (fpr.tolist(), tpr.tolist())
 
         cm = confusion_matrix(y, y_pred).tolist()
         cm_data[nom] = cm
@@ -618,7 +680,7 @@ async def evaluer_classification(df: pd.DataFrame, label: str) -> tuple[pd.DataF
             "Rappel":    float(recall_score(y, y_pred, zero_division=0)),
         })
 
-    return pd.DataFrame(lignes), {}, cm_data
+    return pd.DataFrame(lignes), roc_data, cm_data
 
 
 # ─────────────────────────────────────────────
@@ -638,7 +700,7 @@ def tracer_matrices_confusion(cm_data: dict, horodatage: str) -> list[str]:
     for nom, cm_list in cm_data.items():
         cm  = np.array(cm_list)
         fig, ax = plt.subplots(figsize=(5, 4))
-        im = ax.imshow(cm, interpolation="nearest", cmap="Blues")
+        im = ax.imshow(cm, interpolation="nearest", cmap="YlOrRd")
         fig.colorbar(im, ax=ax, shrink=0.8)
 
         ax.set_title(
@@ -654,11 +716,11 @@ def tracer_matrices_confusion(cm_data: dict, horodatage: str) -> list[str]:
         ax.set_xticklabels(tick_labels, fontsize=9, rotation=15)
         ax.set_yticklabels(tick_labels, fontsize=9)
 
-        thresh = cm.max() / 2.0
+        thresh = cm.max() * 0.6
         for row in range(cm.shape[0]):
             for col in range(cm.shape[1]):
                 ax.text(col, row, f"{cm[row, col]:,}",
-                        ha="center", va="center", fontsize=12,
+                        ha="center", va="center", fontsize=12, fontweight="bold",
                         color="white" if cm[row, col] > thresh else "black")
 
         fig.tight_layout()
@@ -675,23 +737,22 @@ def tracer_courbes_roc(roc_data: dict, horodatage: str) -> str:
     """Trace toutes les courbes ROC sur un même graphique. Retourne le chemin du PNG."""
     import matplotlib.pyplot as plt
 
-    fig, ax = plt.subplots(figsize=(9, 7))
-    ax.plot([0, 1], [0, 1], "k--", lw=1, label="Aléatoire (AUC = 0.50)")
+    fig, ax = plt.subplots(figsize=(7, 6))
+    ax.plot([0, 1], [0, 1], "k--", lw=1)
 
     couleurs = [plt.cm.get_cmap("tab10")(i) for i in range(10)]
     for i, (nom, (fpr, tpr)) in enumerate(sorted(roc_data.items())):
         auc_approx = float(np.trapezoid(tpr, fpr))
         ax.plot(fpr, tpr, lw=2, color=couleurs[i % len(couleurs)],
-                label=f"{nom}  (AUC ≈ {auc_approx:.3f})")
+                label=f"{nom} (AUC={auc_approx:.2f})")
 
-    ax.set_xlabel("Taux de faux positifs (FPR)", fontsize=12)
-    ax.set_ylabel("Taux de vrais positifs (TPR)", fontsize=12)
-    ax.set_title(f"Courbes ROC — Classification retard > {SEUIL_RETARD}s\n"
-                 f"(moyenne sur {N_FOLDS} folds StratifiedKFold)", fontsize=13)
-    ax.legend(loc="lower right", fontsize=10)
+    ax.set_xlabel("False Positive Rate", fontsize=11)
+    ax.set_ylabel("True Positive Rate", fontsize=11)
+    ax.set_title("Courbes ROC", fontsize=13)
+    ax.legend(loc="lower right", fontsize=10, framealpha=0.9)
     ax.set_xlim(0, 1)
     ax.set_ylim(0, 1)
-    ax.grid(alpha=0.3)
+    ax.grid(True, alpha=0.3)
 
     os.makedirs(_DOSSIER, exist_ok=True)
     chemin = os.path.join(_DOSSIER, f"roc_curves_{horodatage}.png")
@@ -716,9 +777,21 @@ async def main():
 
     df = charger(args.csv) if args.csv else _charger_api()
 
-    if len(df) < N_FOLDS * 2:
-        print(f"  Pas assez de données ({len(df)} lignes). Abandon.")
-        return
+    # Filtre RER / Transilien uniquement
+    if "nom_ligne" in df.columns:
+        avant = len(df)
+        df = df[df["nom_ligne"].isin(LIGNES_RER_TRANSILIEN)].reset_index(drop=True)
+        print(f"  Filtre RER/Transilien : {avant:,} → {len(df):,} lignes"
+              f"  ({avant - len(df):,} retirées)")
+
+    # Trier chronologiquement UNE SEULE FOIS avant tout traitement
+    if "date_capture" in df.columns:
+        df["date_capture"] = pd.to_datetime(df["date_capture"], errors="coerce")
+        df = df.sort_values("date_capture", na_position="first").reset_index(drop=True)
+        valid = df["date_capture"].notna()
+        print(f"  Données triées chronologiquement"
+              f"  ({df.loc[valid, 'date_capture'].min()} → {df.loc[valid, 'date_capture'].max()})")
+
     df = transformer_dataset(df)
 
     from datetime import datetime

@@ -694,6 +694,12 @@ def build_features(csv_path: str = CSV_FILE) -> pd.DataFrame:
         mask_vide = df["nom_ligne"].isna() | (df["nom_ligne"].astype(str).str.strip() == "")
         df.loc[mask_vide, "nom_ligne"] = df.loc[mask_vide, "line_ref"].map(resoudre_nom_ligne)
 
+    # 0b. Filtrer les lignes non surveillées (même logique que filter_line à la collecte)
+    lignes_surveillees = set(LIGNES.keys())
+    avant = len(df)
+    df = df[df["nom_ligne"].isin(lignes_surveillees)].reset_index(drop=True)
+    log.info(f"  build_features filter : {avant} → {len(df)} lignes (non surveillées retirées)")
+
     # 1. Retard arrivée en secondes
     arr_est  = pd.to_datetime(df["horaire_depart_estime"], utc=True, errors="coerce")
     arr_prev = pd.to_datetime(df["horaire_depart_prevu"],  utc=True, errors="coerce")
@@ -848,7 +854,16 @@ def collecter_snapshot_ml():
         writer.writeheader()
         writer.writerows(rows)
 
-    return 
+    # Fichier 2 — feature engineering sur le fichier temporaire
+    try:
+        df = build_features(_tmp)
+        df = impute_missing(df)
+        df.to_csv(CSV_FILE_ML, index=False, encoding="utf-8-sig")
+        log.info(f"  Fichier 2 (ML-ready) → {os.path.abspath(CSV_FILE_ML)}  ({len(df):,} lignes)")
+    finally:
+        os.unlink(_tmp)
+
+    return df
 
 
 # ─────────────────────────────────────────────
@@ -874,8 +889,13 @@ def main():
     parser = argparse.ArgumentParser(description="Construction du dataset PRIM IDFM")
     parser.add_argument("--collecter",  action="store_true",
                         help="Collecte API continue → fichier 1 (CSV brut, sans transformation)")
+    parser.add_argument("--construire", action="store_true",
+                        help="Feature engineering → fichier 2 (dataset_ml.csv). "
+                             "Avec --csv : lit le CSV fourni. Sans --csv : appelle l'API.")
     parser.add_argument("--csv",   default=None, metavar="PATH",
                         help="CSV brut source pour --construire (défaut : appel API)")
+    parser.add_argument("--output", default=None, metavar="PATH",
+                        help="Chemin de sortie pour --construire (défaut : dataset_predictions/dataset_ml.csv)")
     parser.add_argument("--duree", type=float, default=None, metavar="HEURES",
                         help="Durée de collecte en heures pour --collecter (défaut : infinie)")
     args = parser.parse_args()
@@ -891,8 +911,28 @@ def main():
         msg = (f"Démarrage collecte — durée : {args.duree}h"
                if args.duree else "Démarrage collecte — durée : infinie (Ctrl+C pour arrêter)")
         log.info(msg)
-        collecter_en_continu(duree_heures=args.duree,csv_file = csv_collecte)
+        collecter_en_continu(duree_heures=args.duree, csv_file=csv_collecte)
 
-   
+    if args.construire:
+        csv_src = args.csv
+        if not csv_src:
+            log.info("Aucun --csv fourni : collecte API snapshot → fichier 1")
+            rows = get_estimated_timetable()
+            if not rows:
+                raise ValueError("L'API PRIM n'a retourné aucune donnée.")
+            ecrire_csv(rows, CSV_FILE)
+            csv_src = CSV_FILE
+            log.info(f"  Fichier 1 → {os.path.abspath(CSV_FILE)}")
+
+        log.info(f"Feature engineering sur : {csv_src}")
+        df = build_features(csv_src)
+        df = impute_missing(df)
+
+        out = args.output or CSV_FILE_ML
+        os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
+        df.to_csv(out, index=False, encoding="utf-8-sig")
+        log.info(f"  Fichier 2 (ML-ready) → {os.path.abspath(out)}  ({len(df):,} lignes)")
+
+
 if __name__ == "__main__":
     main()
