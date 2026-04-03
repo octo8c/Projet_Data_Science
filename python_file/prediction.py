@@ -24,7 +24,7 @@ import sys
 from concurrent.futures import ProcessPoolExecutor
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from build_dataset import preparer_ml, collecter_snapshot_ml, ML_COLONNES
+from build_dataset import collecter_snapshot_ml
 
 import numpy as np
 import pandas as pd

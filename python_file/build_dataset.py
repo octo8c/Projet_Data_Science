@@ -28,11 +28,8 @@ import time
 import logging
 from datetime import datetime, timezone
 
-import numpy as np
 import pandas as pd
 import requests
-from sklearn.preprocessing import TargetEncoder
-from sklearn.model_selection import train_test_split
 
 # ─────────────────────────────────────────────
 # CONFIGURATION
@@ -271,7 +268,7 @@ def _parse_journey(
             "alerte_active":          alerte_active,
             "categorie_alerte":       categorie_alerte,
             "date_capture":           now_capture,
-            "retard_sec":             _calc_retard_sec(aimed_arr, exp_arr),
+            "retard_sec":             _calc_retard_sec(aimed_dep, exp_dep),
         })
     return rows
 
@@ -698,8 +695,8 @@ def build_features(csv_path: str = CSV_FILE) -> pd.DataFrame:
         df.loc[mask_vide, "nom_ligne"] = df.loc[mask_vide, "line_ref"].map(resoudre_nom_ligne)
 
     # 1. Retard arrivée en secondes
-    arr_est  = pd.to_datetime(df["horaire_arrivee_estime"], utc=True, errors="coerce")
-    arr_prev = pd.to_datetime(df["horaire_arrivee_prevu"],  utc=True, errors="coerce")
+    arr_est  = pd.to_datetime(df["horaire_depart_estime"], utc=True, errors="coerce")
+    arr_prev = pd.to_datetime(df["horaire_depart_prevu"],  utc=True, errors="coerce")
     df["retard_sec"] = (arr_est - arr_prev).dt.total_seconds().round().astype("Int64")
 
     # 3. Référence temporelle locale Paris
