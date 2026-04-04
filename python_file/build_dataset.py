@@ -554,12 +554,13 @@ def _classifier_alerte(texte: str) -> str:
 
 
 def _cat_jour(date_str, weekday: int) -> str:
-    """Retourne la catégorie jour IDFM (DIJFP / SAHV / JOHV)."""
+    """Retourne la catégorie jour IDFM (DIJFP / SAHV / SAVS / JOHV / JOVS)."""
     if est_jour_ferie(date_str) or weekday == 6:
         return "DIJFP"
+    vacances = est_vacances(date_str)
     if weekday == 5:
-        return "SAHV"
-    return "JOHV"
+        return "SAVS" if vacances else "SAHV"
+    return "JOVS" if vacances else "JOHV"
 
 
 def _fetch_meteo_paris_horaire(dates: "list[str]") -> "dict[tuple, dict]":
@@ -680,6 +681,54 @@ def _charger_referentiel_arrets() -> "dict[str, str]":
     return stop_dict
 
 
+_QUAY_TO_ZDC_CACHE: dict | None = None
+
+def _build_quay_to_zdc_map() -> dict:
+    """
+    Construit {stop_ref_id (int) → id_zdc (int)} via GTFS stops.txt :
+      stop_ref STIF:StopPoint:Q:22156: → numeric ID 22156
+      GTFS stops.txt : IDFM:22156 → parent_station IDFM:71139 (= ID_ZDC occupation)
+
+    Retourne {} si le fichier GTFS stops.txt est absent.
+    """
+    global _QUAY_TO_ZDC_CACHE
+    if _QUAY_TO_ZDC_CACHE is not None:
+        return _QUAY_TO_ZDC_CACHE
+
+    gtfs_candidates = [
+        d for d in os.listdir(".")
+        if os.path.isdir(d) and d.startswith("IDFM-gtfs")
+    ]
+    if not gtfs_candidates:
+        log.warning("  GTFS absent — occupation non joinable par ID")
+        _QUAY_TO_ZDC_CACHE = {}
+        return {}
+
+    stops_path = os.path.join(gtfs_candidates[0], "stops.txt")
+    if not os.path.exists(stops_path):
+        log.warning("  stops.txt absent — occupation non joinable par ID")
+        _QUAY_TO_ZDC_CACHE = {}
+        return {}
+
+    # stop_id format IDFM:{numeric} (sans préfixe monomodalStopPlace)
+    # correspond directement aux Q/BP IDs extraits de stop_ref
+    stops = pd.read_csv(stops_path, usecols=["stop_id", "parent_station"])
+    stops = stops[
+        stops["stop_id"].str.match(r"^IDFM:\d+$", na=False) &
+        stops["parent_station"].notna()
+    ].copy()
+    stops["stop_num"] = stops["stop_id"].str.extract(r":(\d+)$")[0].astype(int)
+    stops["zdc_id"]   = stops["parent_station"].str.extract(r":(\d+)$")[0]
+    stops["zdc_id"]   = pd.to_numeric(stops["zdc_id"], errors="coerce")
+    stops = stops.dropna(subset=["zdc_id"])
+    stops["zdc_id"] = stops["zdc_id"].astype(int)
+
+    result = dict(zip(stops["stop_num"], stops["zdc_id"]))
+    log.info(f"  Mapping stop_ref→ZDC chargé : {len(result):,} arrêts")
+    _QUAY_TO_ZDC_CACHE = result
+    return result
+
+
 def build_features(csv_path: str = CSV_FILE) -> pd.DataFrame:
     """
     Charge un CSV brut (schéma courant) et calcule toutes les features.
@@ -710,6 +759,12 @@ def build_features(csv_path: str = CSV_FILE) -> pd.DataFrame:
         df["horaire_arrivee_prevu"].fillna(df["horaire_depart_prevu"]),
         utc=True, errors="coerce",
     ).dt.tz_convert("Europe/Paris")
+    # Fallback sur date_capture quand les horaires prévus sont absents
+    if "date_capture" in df.columns:
+        ref_dt_fallback = pd.to_datetime(
+            df["date_capture"], utc=True, errors="coerce"
+        ).dt.tz_convert("Europe/Paris")
+        ref_dt = ref_dt.fillna(ref_dt_fallback)
     df["mois"]       = ref_dt.dt.month
     df["_date_str"]  = ref_dt.dt.strftime("%Y-%m-%d")
     df["_heure_int"] = ref_dt.dt.hour
@@ -762,34 +817,41 @@ def build_features(csv_path: str = CSV_FILE) -> pd.DataFrame:
     taux_rempli = df["nom_arret"].notna().mean()
     log.info(f"  nom_arret rempli : {taux_rempli:.1%} des lignes")
 
-    # 11. Occupation horaire (entrées/heure, jointure datasets IDFM)
+    # 11. Occupation horaire (entrées/heure, jointure via GTFS quay→ZDC)
     df_occ = pd.read_csv(
         "dataset_other/occupation_horaire.csv", sep=";", low_memory=False,
-        usecols=["LIBELLE_ARRET", "CAT_JOUR", "HEURE", "NB_ENTREES_HEURE"],
-    ).dropna(subset=["LIBELLE_ARRET", "HEURE"])
-    df_occ["_nom"]  = df_occ["LIBELLE_ARRET"].str.upper().str.strip()
-    df_occ["HEURE"] = df_occ["HEURE"].astype("Int64")
-
-    df_ar = pd.read_csv("dataset_other/arrets .csv", sep=";", low_memory=False,
-                        usecols=["ArRId", "ArRName"])
-    df_ar["_ArRId"] = df_ar["ArRId"].astype("Int64")
-    df_ar["_nom"]   = df_ar["ArRName"].str.upper().str.strip()
+        usecols=["ID_ZDC", "CAT_JOUR", "HEURE", "NB_ENTREES_HEURE"],
+    ).dropna(subset=["ID_ZDC", "HEURE"])
+    df_occ["_id_zdc"] = pd.to_numeric(df_occ["ID_ZDC"], errors="coerce").astype("Int64")
+    df_occ["HEURE"]   = df_occ["HEURE"].astype("Int64")
+    # Agréger (plusieurs lignes possibles par ZDC/CAT_JOUR/HEURE = plusieurs lignes/modes)
+    df_occ = (
+        df_occ.groupby(["_id_zdc", "CAT_JOUR", "HEURE"], as_index=False)["NB_ENTREES_HEURE"]
+        .sum()
+    )
 
     df["_cat_jour"] = [
         _cat_jour(d, datetime.strptime(d, "%Y-%m-%d").weekday() if isinstance(d, str) and len(d) == 10 else 0)
         for d in df["_date_str"]
     ]
 
-    df = df.merge(df_ar[["_ArRId", "_nom"]], on="_ArRId", how="left")
+    # Mapping stop_ref (Q/BP numeric ID) → ID_ZDC via GTFS object_codes_extension + stops
+    quay_to_zdc = _build_quay_to_zdc_map()
+    df["_id_zdc"] = df["_ArRId"].apply(
+        lambda x: quay_to_zdc.get(int(x)) if pd.notna(x) else None
+    ).astype("Int64")
+    taux_zdc = df["_id_zdc"].notna().mean()
+    log.info(f"  ID_ZDC résolu : {taux_zdc:.1%} des lignes")
+
     df = df.merge(
-        df_occ[["_nom", "CAT_JOUR", "HEURE", "NB_ENTREES_HEURE"]].rename(
+        df_occ[["_id_zdc", "CAT_JOUR", "HEURE", "NB_ENTREES_HEURE"]].rename(
             columns={"CAT_JOUR": "_cat_jour", "HEURE": "_heure_int"}
         ),
-        on=["_nom", "_cat_jour", "_heure_int"],
+        on=["_id_zdc", "_cat_jour", "_heure_int"],
         how="left",
     )
     df.rename(columns={"NB_ENTREES_HEURE": "occupation"}, inplace=True)
-    df.drop(columns=["_ArRId", "_nom", "_date_str", "_heure_int", "_cat_jour"],
+    df.drop(columns=["_ArRId", "_id_zdc", "_date_str", "_heure_int", "_cat_jour"],
             inplace=True, errors="ignore")
 
     return df
@@ -821,7 +883,8 @@ def impute_missing(df: pd.DataFrame) -> pd.DataFrame:
         df.groupby(["nom_ligne", "heure_tranche"])["occupation"].transform("mean")
     )
     if df["occupation"].isna().any():
-        df[["occupation"]] = SimpleImputer(strategy="mean").fit_transform(df[["occupation"]])
+        mean_occ = df["occupation"].mean()
+        df["occupation"] = df["occupation"].fillna(mean_occ if pd.notna(mean_occ) else 0)
 
     return df
 
